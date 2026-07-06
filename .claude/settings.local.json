@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ruby tmp/make_fixtures.rb)",
+      "Bash(ruby bin/file_organizer tmp/fixtures)",
+      "Bash(ruby bin/file_organizer --mode photo tmp/fixtures)",
+      "Bash(ruby bin/file_organizer -m audio tmp/fixtures)",
+      "Bash(ruby bin/file_organizer tmp/scratch)",
+      "Bash(ruby bin/file_organizer --help)",
+      "Bash(ruby bin/file_organizer --version)",
+      "Bash(ruby bin/file_organizer /nonexistent)"
+    ]
+  }
+}
