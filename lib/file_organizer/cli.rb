@@ -7,6 +7,10 @@ module FileOrganizer
   # Interactive command-line interface: walks the files of a directory one
   # by one, shows their details, and offers open/view, rename, copy, move
   # and delete actions.
+  #
+  # It also parses the options for, and hands over to, the graphical
+  # interface (see FileOrganizer::Gui), which offers the same actions in a
+  # page instead of a prompt.
   class CLI
     MODES = %i[general photo audio].freeze
 
@@ -17,10 +21,15 @@ module FileOrganizer
 
     def initialize(argv)
       @mode = :general
+      @gui = false
+      @port = 0
+      @browser = true
       @directory_arg = parse_options(argv)
     end
 
     def run
+      return run_gui if @gui
+
       directory = resolve_directory
       return if directory.nil?
 
@@ -55,6 +64,10 @@ module FileOrganizer
         opts.banner = "Usage: file_organizer [options] [DIRECTORY]"
         opts.on("-m", "--mode MODE", MODES.map(&:to_s),
                 "Mode: general (default), photo, audio") { |m| @mode = m.to_sym }
+        opts.on("-g", "--gui", "Open the graphical interface in your browser") { @gui = true }
+        opts.on("-p", "--port PORT", Integer,
+                "GUI port (default: an unused port chosen by the OS)") { |p| @port = p }
+        opts.on("--[no-]browser", "GUI: launch the browser automatically (default: yes)") { |b| @browser = b }
         opts.on("-h", "--help", "Show this help") do
           puts opts
           exit
@@ -66,11 +79,25 @@ module FileOrganizer
       end
     end
 
+    # Starts the local web GUI; the terminal is only used for the banner.
+    def run_gui
+      abort("file_organizer: --port must be between 0 and 65535.") unless (0..65_535).cover?(@port)
+
+      directory = File.expand_path(@directory_arg || Dir.pwd)
+      error = Directory.error(directory)
+      abort("file_organizer: #{Console.safe(error)}") if error
+
+      require_relative "gui"
+      Gui.start(directory: directory, mode: @mode, port: @port, open_browser: @browser)
+    rescue Interrupt
+      Console.say("\nStopped.")
+    end
+
     def resolve_directory
       if @directory_arg
         directory = File.expand_path(@directory_arg)
-        error = directory_error(directory)
-        abort("file_organizer: #{error}") if error
+        error = Directory.error(directory)
+        abort("file_organizer: #{Console.safe(error)}") if error
         return directory
       end
 
@@ -79,32 +106,18 @@ module FileOrganizer
         return nil if input.nil? || input.empty?
 
         directory = File.expand_path(input)
-        error = directory_error(directory)
+        error = Directory.error(directory)
         return directory if error.nil?
 
-        Console.say("  #{error}")
+        Console.say("  #{Console.safe(error)}")
       end
-    end
-
-    def directory_error(directory)
-      return "does not exist: #{Console.safe(directory)}" unless File.exist?(directory)
-      return "not a directory: #{Console.safe(directory)}" unless File.directory?(directory)
-      return "directory is not readable: #{Console.safe(directory)}" unless File.readable?(directory)
-
-      nil
     end
 
     # Regular files and symlinks only — subdirectories are never touched.
     def scan(directory)
-      Dir.children(directory).sort_by(&:downcase).filter_map do |name|
-        path = File.join(directory, name)
-        next unless File.symlink?(path) || File.file?(path)
-
-        info = FileInfo.new(path)
-        info if include_in_mode?(info)
-      rescue SystemCallError
-        nil
-      end
+      files, truncated = Directory.entries(directory)
+      Console.say("Only the first #{Directory::MAX_ENTRIES} entries are listed.") if truncated
+      files.select { |info| include_in_mode?(info) }
     end
 
     def include_in_mode?(info)
@@ -168,8 +181,8 @@ module FileOrganizer
 
     def menu_prompt(info)
       parts = []
-      parts << "[o]pen" if openable?(info)
-      parts << "[v]iew" if viewable?(info)
+      parts << "[o]pen" if info.openable?
+      parts << "[v]iew" if info.textual?
       parts << "[r]ename"
       parts.push("[c]opy", "[m]ove") if info.regular?
       parts << "[d]elete"
@@ -184,16 +197,8 @@ module FileOrganizer
       MENU_KEYS[input[0].downcase]
     end
 
-    def openable?(info)
-      info.regular? && !info.executable_bit? && info.category != :executable
-    end
-
-    def viewable?(info)
-      info.regular? && info.detection&.textual?
-    end
-
     def open_file(info)
-      unless openable?(info)
+      unless info.openable?
         Console.say("  Opening is disabled for this file (executable content or not a regular file).")
         return
       end
@@ -205,7 +210,7 @@ module FileOrganizer
     end
 
     def view_file(info)
-      unless viewable?(info)
+      unless info.textual?
         Console.say("  In-terminal preview is only available for text-based files; use [o]pen instead.")
         return
       end

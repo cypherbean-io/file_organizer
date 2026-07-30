@@ -1,0 +1,4 @@
+# Test data written by tmp/make_fixtures.rb and used for manual runs.
+/tmp/fixtures/
+/tmp/scratch/
+/tmp/dest/

@@ -24,6 +24,12 @@ module FileOrganizer
       $stdout.puts(text)
     end
 
+    # Output is line-buffered on a terminal but block-buffered when it is
+    # redirected, so anything the user has to act on is flushed explicitly.
+    def flush
+      $stdout.flush
+    end
+
     def field(label, value, indent: 2)
       say(format("%s%-22s %s", " " * indent, "#{label}:", value))
     end

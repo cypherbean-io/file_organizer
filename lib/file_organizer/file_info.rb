@@ -30,6 +30,10 @@ module FileOrganizer
       @stat.size
     end
 
+    def mtime
+      @stat.mtime
+    end
+
     def hidden?
       name.start_with?(".")
     end
@@ -40,6 +44,32 @@ module FileOrganizer
 
     def category
       detection&.category
+    end
+
+    def content_format
+      detection&.format
+    end
+
+    # Executables are never launched, and only regular files are handed to the
+    # system opener at all.
+    def openable?
+      regular? && !executable_bit? && category != :executable
+    end
+
+    # True when the content is text and can therefore be previewed directly.
+    def textual?
+      regular? && detection&.textual? || false
+    end
+
+    def extension_mismatch?
+      regular? && TypeDetector.extension_mismatch?(path, detection)
+    end
+
+    # Short, human-facing description of what this file is.
+    def kind
+      return "Symbolic link" if symlink?
+
+      detection&.description || @stat.ftype.capitalize
     end
 
     def rows
@@ -75,8 +105,8 @@ module FileOrganizer
 
     def extension_rows
       ext = File.extname(name)
-      rows = [["Extension", ext.empty? ? "(none)" : Console.safe(ext.downcase)]]
-      if TypeDetector.extension_mismatch?(path, detection)
+      rows = [["Extension", ext.empty? ? "(none)" : Console.safe(ext.b.downcase)]]
+      if extension_mismatch?
         rows << ["Warning", "extension does not match detected content"]
       end
       rows
