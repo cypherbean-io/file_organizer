@@ -27,6 +27,18 @@ module FileOrganizer
       !!system(*command)
     end
 
+    # Hands a loopback URL to the system browser, again as an argument vector.
+    # The address is built by the program itself, and checked here anyway so
+    # this can never become a way to launch something else.
+    def open_url(url)
+      return false unless url.start_with?("http://127.0.0.1:")
+
+      command = opener_command(url)
+      return false if command.nil?
+
+      !!system(*command, out: File::NULL, err: File::NULL)
+    end
+
     def opener_command(absolute_path)
       case RbConfig::CONFIG["host_os"]
       when /darwin/i then ["open", absolute_path]

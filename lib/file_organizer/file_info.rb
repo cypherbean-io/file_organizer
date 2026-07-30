@@ -9,6 +9,13 @@ module FileOrganizer
   class FileInfo
     TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
+    # Extensions the platform openers treat as "run this", whatever the bytes
+    # inside happen to look like.
+    LAUNCHABLE_EXTENSIONS = %w[
+      .desktop .lnk .url .scf .hta .reg .exe .com .bat .cmd .ps1 .psm1 .msi
+      .scr .pif .vbs .vbe .wsf .wsh .jar .app .command .scpt .workflow
+    ].map(&:b).freeze
+
     attr_reader :path, :name
 
     def initialize(path)
@@ -24,6 +31,19 @@ module FileOrganizer
       return @detection if defined?(@detection)
 
       @detection = regular? ? TypeDetector.detect(path) : nil
+    end
+
+    # Lets a caller that has already examined this exact content (see
+    # +content_key+) hand the result over instead of reading the file again.
+    def detection=(detection)
+      @detection = detection
+    end
+
+    # Identifies this version of this file: replacing, resizing or writing to
+    # it changes at least one of these, so a detection stored against the key
+    # is still valid while the key is unchanged.
+    def content_key
+      [path, @stat.dev, @stat.ino, @stat.size, @stat.mtime.to_r, @stat.ctime.to_r]
     end
 
     # True when the extension claims a type the content contradicts.
@@ -45,6 +65,10 @@ module FileOrganizer
       @stat.size
     end
 
+    def mtime
+      @stat.mtime
+    end
+
     def hidden?
       name.start_with?(".")
     end
@@ -55,6 +79,35 @@ module FileOrganizer
 
     def category
       detection&.category
+    end
+
+    def content_format
+      detection&.format
+    end
+
+    # Executables and launchers are never opened, and only regular files are
+    # handed to the system opener at all.
+    def openable?
+      regular? && !executable_bit? && category != :executable && !launchable_extension?
+    end
+
+    # Some extensions are instructions to the desktop, not data: a .desktop
+    # entry or a .lnk shortcut hands the system an arbitrary command line
+    # even though the file itself is inert text.
+    def launchable_extension?
+      LAUNCHABLE_EXTENSIONS.include?(File.extname(name).b.downcase)
+    end
+
+    # True when the content is text and can therefore be previewed directly.
+    def textual?
+      regular? && detection&.textual? || false
+    end
+
+    # Short, human-facing description of what this file is.
+    def kind
+      return "Symbolic link" if symlink?
+
+      detection&.description || @stat.ftype.capitalize
     end
 
     def rows
@@ -90,7 +143,7 @@ module FileOrganizer
 
     def extension_rows
       ext = File.extname(name)
-      rows = [["Extension", ext.empty? ? "(none)" : Console.safe(ext.downcase)]]
+      rows = [["Extension", ext.empty? ? "(none)" : Console.safe(ext.b.downcase)]]
       if extension_mismatch?
         rows << ["Warning", "extension does not match detected content"]
       end

@@ -35,11 +35,12 @@ class TestCLIMenuParsing < Minitest::Test
   end
 end
 
-class TestCLIOpenGuards < Minitest::Test
+# The rule lives in FileInfo so the terminal and the GUI share it.
+class TestOpenGuards < Minitest::Test
   include OrganizerTest
 
   def openable?(name, content)
-    CLI.new([@dir]).send(:openable?, FileInfo.new(write(name, content)))
+    FileInfo.new(write(name, content)).openable?
   end
 
   def test_plain_documents_can_be_opened
@@ -53,7 +54,7 @@ class TestCLIOpenGuards < Minitest::Test
   def test_files_with_the_executable_bit_cannot_be_opened
     file = write("run.txt", "hello\n")
     File.chmod(0o755, file)
-    refute CLI.new([@dir]).send(:openable?, FileInfo.new(file))
+    refute FileInfo.new(file).openable?
   end
 
   # A .desktop entry is inert text that tells the desktop to run an arbitrary
@@ -62,6 +63,12 @@ class TestCLIOpenGuards < Minitest::Test
     refute openable?("innocent.desktop", "[Desktop Entry]\nExec=rm -rf ~\n")
     refute openable?("shortcut.lnk", "plain text\n")
     refute openable?("installer.msi", "plain text\n")
+    refute openable?("LOUD.DESKTOP", "[Desktop Entry]\n")
+  end
+
+  def test_a_symlink_is_never_handed_to_the_opener
+    File.symlink(write("real.txt"), path("link.txt"))
+    refute FileInfo.new(path("link.txt")).openable?
   end
 end
 
@@ -131,12 +138,20 @@ class TestCLISession < Minitest::Test
   end
 
   def test_system_and_home_directories_need_an_explicit_confirmation
-    cli = CLI.new([@dir])
     %w[/ /etc /etc/nginx /usr/local/bin /var].each do |directory|
-      assert cli.send(:guarded_directory?, directory), directory
+      assert Directory.guarded?(directory), directory
     end
-    assert cli.send(:guarded_directory?, File.expand_path(Dir.home))
-    refute cli.send(:guarded_directory?, @dir)
+    assert Directory.guarded?(File.expand_path(Dir.home))
+    refute Directory.guarded?(@dir)
+    refute Directory.guarded?("/etcetera"), "a prefix of a guarded name is not inside it"
+  end
+
+  def test_declining_the_guarded_directory_prompt_reviews_nothing
+    cli = CLI.new([@dir])
+    refute answering("y") { cli.send(:confirm_guarded_directory, "/etc") }
+    assert_includes output, "Cancelled"
+    assert answering("yes") { cli.send(:confirm_guarded_directory, "/etc") }
+    assert CLI.new(["--read-only", @dir]).send(:confirm_guarded_directory, "/etc")
   end
 
   def test_scan_lists_files_and_symlinks_but_never_subdirectories
@@ -163,11 +178,11 @@ class TestCLISession < Minitest::Test
   end
 end
 
-class TestCLIChecksum < Minitest::Test
+class TestChecksum < Minitest::Test
   include OrganizerTest
 
   def checksum(file)
-    CLI.new([@dir]).send(:checksum, file)
+    SafeFile.sha256(file)
   end
 
   def test_matches_the_digest_of_the_whole_file

@@ -1,28 +1,36 @@
 # File Organizer
 
-An interactive, offline command-line tool for reviewing and organizing the
-files in a directory, one file at a time. For each file it shows detailed
-information, then lets you open/view it, rename it, copy or move it to
-another directory, or delete it.
+An interactive, offline tool for reviewing and organizing the files in a
+directory. For each file it shows detailed information, then lets you
+open/view it, rename it, copy or move it to another directory, or delete it.
+
+There are two interfaces over the same core: a terminal one that walks the
+files one at a time, and a **graphical one** that runs in your browser.
 
 Written in pure Ruby (3.0+) with **zero gem dependencies** — everything,
-including the photo (EXIF) and audio (ID3, FLAC, Vorbis, …) metadata
-parsers, uses only the standard library. The program never touches the
-network.
+including the photo (EXIF) and audio (ID3, FLAC, Vorbis, …) metadata parsers
+and the web server behind the graphical interface, uses only the standard
+library. The program never touches the network.
 
 ## Usage
 
 ```sh
-ruby bin/file_organizer [options] [DIRECTORY]
+ruby bin/file_organizer [options] [DIRECTORY]        # terminal
+ruby bin/file_organizer --gui [options] [DIRECTORY]  # browser
 ```
 
-If `DIRECTORY` is omitted you are prompted for one.
+In the terminal you are prompted for a directory if `DIRECTORY` is omitted;
+the graphical interface starts in the current directory and lets you change
+folders from the page.
 
 | Option | Description |
 | --- | --- |
 | `-m`, `--mode MODE` | `general` (default), `photo`, or `audio` |
 | `--read-only` | Inspect only: rename, copy, move, delete and open are all disabled |
 | `--dry-run` | Prompt as usual, but report what each action *would* do and change nothing |
+| `-g`, `--gui` | Open the graphical interface in your browser |
+| `-p`, `--port PORT` | GUI port (default: an unused port chosen by the OS) |
+| `--[no-]browser` | GUI: launch the browser automatically (default: yes) |
 | `-h`, `--help` | Show help |
 | `--version` | Show version |
 
@@ -58,6 +66,50 @@ If `DIRECTORY` is omitted you are prompted for one.
 Each key is matched in full: `d` and `delete` both delete, but a word that
 merely starts with an action letter (`done`, `move it later`) is rejected as
 unrecognized rather than being run.
+
+## Graphical interface
+
+`--gui` starts a small web server on the loopback interface and opens the
+page in your browser. The terminal prints the address, which carries a
+one-time key for the session:
+
+```
+── File Organizer 1.0.0 — graphical interface ──────────────────────────
+  Folder:                /home/you/Downloads
+  Address:               http://127.0.0.1:53017/?t=…
+```
+
+Press Ctrl-C in the terminal, or use Quit in the page, to stop.
+
+The page shows the whole folder at once:
+
+- **Browse** — the file list with a type icon, detected type and size for
+  every entry; filter by name, filter by category (Images, Audio, Video,
+  Documents, Archives, Executables, Text, Data, Links…), and sort by name,
+  size, modification time or type.
+- **Preview** — images are shown (click to zoom), audio and video get a
+  player, text-based files get a numbered preview. Anything else shows why
+  it has no preview.
+- **Inspect** — the same file information the terminal shows, plus the photo
+  or audio metadata for images and audio, and SHA-256 on request.
+- **Act** — open, rename, copy, move and delete, with the same rules and
+  confirmations as the terminal interface.
+- **Gallery view** — thumbnails of the whole folder, which makes sorting
+  through a directory of images much quicker.
+- **Navigate** — the path is a row of breadcrumbs; “Open folder…” takes a
+  path and offers the parent and subfolders as one-click choices.
+- **Keyboard** — `↑`/`↓` or `j`/`k` to move, `o` `r` `c` `m` `d` `h` for the
+  actions, `/` to filter, `g` for gallery, `R` to reload, `T` for the theme,
+  `?` for the list. Dark and light themes follow the system and can be
+  toggled.
+
+A folder lists at most its first 5,000 entries in the page (the terminal
+has no such cap). A file's content is examined once and remembered until the
+file changes, so refreshing a large folder stays quick.
+
+Images are sent to the browser at full size — there is no image processing
+in the standard library to make thumbnails with — so a folder of very large
+photos takes a moment to fill the gallery.
 
 ## Information displayed for every file
 
@@ -140,6 +192,50 @@ covers display sanitizing, every confirmation path, the refusal to write
 through a symlink, menu parsing, type detection, and the metadata parsers'
 behaviour on truncated and pathological files.
 
+### The graphical interface
+
+The GUI is a page served to your own browser, so it comes with its own set
+of rules:
+
+- **Loopback only** — the server binds `127.0.0.1`. It is not reachable from
+  the network, and there is still no outbound network code anywhere.
+- **A one-time key** — every page and API request must carry the key printed
+  in the terminal, so another program on the machine cannot drive the
+  interface. It is new on every run and lives only in memory.
+- **Host and Origin checks** — requests must name our own loopback address
+  (which defeats DNS rebinding), and anything the browser labels as
+  cross-origin or cross-site is refused even if it has the key.
+- **A page that can load nothing** — the Content-Security-Policy allows no
+  script, style, image, font or connection other than the ones this program
+  serves; the page cannot be framed and cannot submit a form anywhere.
+- **Files addressed by opaque id, never by path** — an id decodes to a
+  single file name inside the folder being reviewed, so a crafted request
+  cannot reach anywhere else. (It also means names that are not valid UTF-8
+  survive the round trip.)
+- **Only media is ever served to the page** — image, audio and video bytes,
+  for formats detected by content and streamed in bounded ranges. SVG and
+  PDF are deliberately not rendered in the page, so nothing that could carry
+  script is ever handed to the browser as a document; text files go through
+  the same sanitized preview the terminal uses.
+- **Names and metadata are inserted as text, never as markup** — a file
+  cannot inject anything into the page, just as it cannot inject terminal
+  escape sequences into the terminal.
+- **The same confirmations** — deleting requires typing `yes`, which the
+  server checks too (a request without it is refused, whatever the page
+  does). Overwriting, opening a file whose extension disagrees with its
+  content, and switching to a system or home folder each require an explicit
+  confirmation, and the server refuses all three without one.
+- **The same modes** — `--read-only` and `--dry-run` work with `--gui`. In
+  read-only mode the server refuses every request that would rename, copy,
+  move, delete or open a file, whatever the page sends; in a dry run each
+  action reports what it would have done and changes nothing.
+- **The same file operations** — the GUI calls the very `Operations` the
+  terminal does, so it inherits every rule above: no write through a
+  symlink, no silent overwrite, no launching of executables or launchers.
+- **Bounded requests** — request lines, headers, bodies and connection
+  lifetimes are all capped, and a single event loop hands sockets to workers
+  only when a request is actually arriving on them.
+
 ## Project layout
 
 ```
@@ -150,11 +246,27 @@ lib/file_organizer/console.rb          Safe terminal I/O
 lib/file_organizer/safe_file.rb        Reads that never follow a symlink
 lib/file_organizer/type_detector.rb    Magic-byte type detection
 lib/file_organizer/file_info.rb        Filesystem metadata
+lib/file_organizer/directory.rb        Listing and validating directories
 lib/file_organizer/viewer.rb           Open / preview
-lib/file_organizer/actions.rb          Rename / copy / move / delete
+lib/file_organizer/operations.rb       Validated rename / copy / move / delete
+lib/file_organizer/actions.rb          The prompts and confirmations around them
 lib/file_organizer/metadata/binary.rb        Bounds-checked binary readers
 lib/file_organizer/metadata/exif_parser.rb   Pure-Ruby TIFF/EXIF parser
 lib/file_organizer/metadata/photo.rb         Image metadata
 lib/file_organizer/metadata/audio.rb         Audio metadata
+lib/file_organizer/gui.rb              GUI entry point, opaque file ids
+lib/file_organizer/gui/server.rb       Loopback HTTP server (event loop)
+lib/file_organizer/gui/connection.rb   Bounded HTTP request parsing
+lib/file_organizer/gui/request.rb      One parsed request
+lib/file_organizer/gui/response.rb     One response (in-memory or streamed)
+lib/file_organizer/gui/app.rb          Routing, guards, request handling
+lib/file_organizer/gui/session.rb      Which folder is being reviewed, and how
+lib/file_organizer/gui/presenter.rb    Files and metadata as plain data
+lib/file_organizer/gui/web/            The page: index.html, app.css, app.js
 test/                                  Test suite (ruby test/all.rb)
 ```
+
+Both interfaces share the core: `Operations` performs every filesystem
+change, `Directory` lists folders, `FileInfo` and `TypeDetector` describe
+files, `Metadata::*` parses them. The GUI adds a server and a page; it does
+not add a second implementation of anything that touches your files.

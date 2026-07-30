@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "digest"
+
 module FileOrganizer
   # Opens files for reading without ever following a symbolic link.
   #
@@ -31,6 +33,19 @@ module FileOrganizer
     # Reads at most +length+ bytes; returns nil at end of file.
     def read(path, length)
       open(path) { |io| io.read(length) }
+    end
+
+    # Streamed in 1 MiB chunks, so even a huge file never lands in memory,
+    # and read without following a link so the digest describes the file
+    # that was inspected rather than whatever a link now points at.
+    def sha256(path)
+      digest = Digest::SHA256.new
+      open(path) do |io|
+        while (chunk = io.read(1 << 20))
+          digest.update(chunk)
+        end
+      end
+      digest.hexdigest
     end
   end
 end
