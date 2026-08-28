@@ -6,6 +6,11 @@ module FileOrganizer
     # only header/metadata segments are loaded, never the whole image.
     module Photo
       MAX_METADATA_BYTES = 1 << 20 # 1 MiB cap on any metadata segment
+      SCAN_BLOCK_BYTES = 16 * 1024
+      MAX_RESYNC_BYTES = 1 << 20 # cap on hunting for a marker in a corrupt file
+
+      MARKER_PREFIX = "\xFF".b.freeze
+      NOT_FILL = /[^\xFF]/n.freeze
 
       SOF_MARKERS = [0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
                      0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF].freeze
@@ -35,7 +40,7 @@ module FileOrganizer
       def jpeg(path)
         fields = {}
         exif = nil
-        File.open(path, "rb") do |io|
+        SafeFile.open(path) do |io|
           return {} unless io.read(2) == "\xFF\xD8".b
 
           while (marker = next_marker(io))
@@ -66,7 +71,7 @@ module FileOrganizer
       end
 
       def png(path)
-        header = File.open(path, "rb") { |f| f.read(33) }
+        header = SafeFile.read(path, 33)
         return {} unless header&.bytesize == 33 && header.byteslice(12, 4) == "IHDR"
 
         width, height, depth, color, _compression, _filter, interlace =
@@ -79,7 +84,7 @@ module FileOrganizer
       end
 
       def gif(path)
-        header = File.open(path, "rb") { |f| f.read(13) }
+        header = SafeFile.read(path, 13)
         return {} unless header&.bytesize == 13
 
         _signature, width, height = header.unpack("a6vv")
@@ -90,7 +95,7 @@ module FileOrganizer
       end
 
       def bmp(path)
-        header = File.open(path, "rb") { |f| f.read(26) }
+        header = SafeFile.read(path, 26)
         return {} unless header&.bytesize == 26
 
         width, height = header.byteslice(18, 8).unpack("l<l<")
@@ -100,7 +105,7 @@ module FileOrganizer
       end
 
       def tiff(path)
-        data = File.open(path, "rb") { |f| f.read(MAX_METADATA_BYTES) }
+        data = SafeFile.read(path, MAX_METADATA_BYTES)
         exif_fields = ExifParser.new(data).parse
         fields = {}
         width = exif_fields.delete("Width")
@@ -111,7 +116,7 @@ module FileOrganizer
       end
 
       def webp(path)
-        header = File.open(path, "rb") { |f| f.read(30) }
+        header = SafeFile.read(path, 30)
         return {} unless header&.bytesize == 30
 
         fields = {}
@@ -135,7 +140,7 @@ module FileOrganizer
       end
 
       def svg(path)
-        header = File.open(path, "rb") { |f| f.read(4096) }.to_s
+        header = SafeFile.read(path, 4096).to_s
                      .force_encoding(Encoding::UTF_8).scrub("?")
         tag = header[/<svg[^>]*>/i]
         return {} if tag.nil?
@@ -179,18 +184,36 @@ module FileOrganizer
         data
       end
 
+      # In a well-formed JPEG the next marker sits at the read position. A
+      # corrupt or hostile file can make this hunt for one, so the hunt works
+      # over blocks — never a byte at a time — and gives up after
+      # MAX_RESYNC_BYTES rather than walking the whole file. Reading a
+      # multi-gigabyte file with one read(2) per byte is how a single bad
+      # file turns into a hang.
       def next_marker(io)
-        loop do
-          byte = io.read(1)
-          return nil if byte.nil?
-          next unless byte == "\xFF".b
+        scanned = 0
+        seeking_code = false # true once a 0xFF has been seen
 
-          code = io.read(1)
-          code = io.read(1) while code == "\xFF".b
-          return nil if code.nil?
+        while scanned <= MAX_RESYNC_BYTES
+          start = io.pos
+          block = io.read(SCAN_BLOCK_BYTES)
+          return nil if block.nil?
 
-          return code.unpack1("C")
+          scanned += block.bytesize
+          position = seeking_code ? 0 : block.index(MARKER_PREFIX)
+          next if position.nil?
+
+          # A marker is any number of 0xFF fill bytes followed by the code.
+          code_index = block.index(NOT_FILL, position)
+          if code_index.nil?
+            seeking_code = true # the fill run continues into the next block
+            next
+          end
+
+          io.seek(start + code_index + 1, IO::SEEK_SET)
+          return block.getbyte(code_index)
         end
+        nil
       end
     end
   end

@@ -7,6 +7,7 @@ module FileOrganizer
     # and MPEG-4 (M4A) atoms. All reads are bounded.
     module Audio
       MAX_TAG_BYTES = 1 << 20
+      SYNC_BYTE = "\xFF".b.freeze
       MAX_TEXT_BYTES = 4096
 
       ID3V23_FRAMES = {
@@ -71,7 +72,7 @@ module FileOrganizer
 
       def mp3(path)
         fields = {}
-        File.open(path, "rb") do |io|
+        SafeFile.open(path) do |io|
           file_size = io.size
           tags, tag_bytes = id3v2(io)
           fields.merge!(tags)
@@ -193,15 +194,22 @@ module FileOrganizer
         fields
       end
 
+      # Finds the first valid MPEG frame header. String#index jumps straight
+      # to each sync byte instead of testing all 64 KiB one byte at a time
+      # from Ruby, which is the difference between a scan you notice and one
+      # you do not.
       def find_frame(chunk)
         limit = chunk.bytesize - 4
-        i = 0
-        while i < limit
-          if chunk.getbyte(i) == 0xFF && (chunk.getbyte(i + 1) & 0xE0) == 0xE0
-            frame = parse_frame_header(chunk, i)
+        position = 0
+        while position < limit
+          position = chunk.index(SYNC_BYTE, position)
+          break if position.nil? || position >= limit
+
+          if (chunk.getbyte(position + 1) & 0xE0) == 0xE0
+            frame = parse_frame_header(chunk, position)
             return frame if frame
           end
-          i += 1
+          position += 1
         end
         nil
       end
@@ -249,7 +257,7 @@ module FileOrganizer
 
       def wav(path)
         fields = {}
-        File.open(path, "rb") do |io|
+        SafeFile.open(path) do |io|
           riff = io.read(12)
           return {} unless riff&.bytesize == 12 && riff.start_with?("RIFF") &&
                            riff.byteslice(8, 4) == "WAVE"
@@ -288,7 +296,7 @@ module FileOrganizer
 
       def flac(path)
         fields = {}
-        File.open(path, "rb") do |io|
+        SafeFile.open(path) do |io|
           return {} unless io.read(4) == "fLaC"
 
           last = false
@@ -371,7 +379,7 @@ module FileOrganizer
       def ogg(path)
         head = nil
         tail = nil
-        File.open(path, "rb") do |io|
+        SafeFile.open(path) do |io|
           head = io.read(8192).to_s
           tail_size = [io.size, 65_536].min
           io.seek(-tail_size, IO::SEEK_END)
@@ -431,7 +439,7 @@ module FileOrganizer
       }.freeze
 
       def m4a(path)
-        head = File.open(path, "rb") { |f| f.read(2 * MAX_TAG_BYTES) }.to_s
+        head = SafeFile.read(path, 2 * MAX_TAG_BYTES).to_s
         fields = {}
         if head.byteslice(4, 4) == "ftyp"
           brand = head.byteslice(8, 4).to_s.strip
@@ -479,7 +487,7 @@ module FileOrganizer
 
       def aiff(path)
         fields = {}
-        File.open(path, "rb") do |io|
+        SafeFile.open(path) do |io|
           form = io.read(12)
           return {} unless form&.bytesize == 12 && form.start_with?("FORM") &&
                            %w[AIFF AIFC].include?(form.byteslice(8, 4))
