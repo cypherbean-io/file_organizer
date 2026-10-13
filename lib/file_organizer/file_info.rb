@@ -9,13 +9,28 @@ module FileOrganizer
   class FileInfo
     TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-    attr_reader :path, :name, :detection
+    attr_reader :path, :name
 
     def initialize(path)
       @path = path
       @name = File.basename(path)
       @stat = File.lstat(path)
+    end
+
+    # Detection reads the head of the file, so it is deferred until
+    # something actually asks: listing a directory in general mode then
+    # costs one lstat per entry instead of an open and an 8 KiB read.
+    def detection
+      return @detection if defined?(@detection)
+
       @detection = regular? ? TypeDetector.detect(path) : nil
+    end
+
+    # True when the extension claims a type the content contradicts.
+    def extension_mismatch?
+      return @extension_mismatch if defined?(@extension_mismatch)
+
+      @extension_mismatch = regular? && TypeDetector.extension_mismatch?(path, detection)
     end
 
     def regular?
@@ -76,7 +91,7 @@ module FileOrganizer
     def extension_rows
       ext = File.extname(name)
       rows = [["Extension", ext.empty? ? "(none)" : Console.safe(ext.downcase)]]
-      if TypeDetector.extension_mismatch?(path, detection)
+      if extension_mismatch?
         rows << ["Warning", "extension does not match detected content"]
       end
       rows

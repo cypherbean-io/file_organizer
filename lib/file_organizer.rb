@@ -5,6 +5,7 @@ module FileOrganizer
 end
 
 require_relative "file_organizer/version"
+require_relative "file_organizer/safe_file"
 require_relative "file_organizer/console"
 require_relative "file_organizer/type_detector"
 require_relative "file_organizer/file_info"

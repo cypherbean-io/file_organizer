@@ -63,7 +63,7 @@ module FileOrganizer
     end
 
     def read_header(path)
-      File.open(path, "rb") { |f| f.read(HEADER_BYTES) } || ""
+      SafeFile.read(path, HEADER_BYTES) || ""
     rescue SystemCallError, IOError
       nil
     end
