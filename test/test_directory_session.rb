@@ -90,12 +90,17 @@ class TestDirectoryEntries < Minitest::Test
     assert_equal ["apple.txt".b, "Bad.txt".b, INVALID_UTF8_NAME], names(entries)
   end
 
+  # Reading stops after +limit+ entries, so which ones are listed follows
+  # the filesystem's order; the ones listed are sorted.
   def test_limit_truncates_and_reports_it
     %w[a b c d e].each { |name| write("#{name}.txt") }
     entries, truncated = Directory.entries(@dir, limit: 3)
 
-    assert_equal %w[a.txt b.txt c.txt], entries.map(&:name)
+    names = entries.map(&:name)
+    assert_equal 3, names.size
+    assert_equal names.sort, names
     assert truncated
+    refute Directory.entries(@dir, limit: 5).last, "exactly the limit is not truncated"
   end
 
   def test_limit_equal_to_the_entry_count_is_not_truncation
@@ -141,7 +146,7 @@ class TestDirectorySubdirectories < Minitest::Test
     File.symlink(path("A-dir"), path("linked-dir"))
     File.symlink(path("nowhere"), path("dangling"))
 
-    assert_equal %w[A-dir b-dir], Directory.subdirectories(@dir)
+    assert_equal [%w[A-dir b-dir], false], Directory.subdirectories(@dir)
   end
 end
 
@@ -203,6 +208,39 @@ class TestDirectoryGuarded < Minitest::Test
   def test_an_ordinary_directory_is_not_guarded
     refute Directory.guarded?(@dir)
   end
+
+  def test_repeated_separators_do_not_hide_a_guarded_directory
+    assert Directory.guarded?("//etc")
+    assert Directory.guarded?("///usr//local")
+    assert Directory.guarded?("//")
+  end
+
+  def test_a_symlink_to_a_guarded_directory_is_guarded
+    File.symlink("/etc", path("settings"))
+    assert Directory.guarded?(path("settings"))
+  end
+end
+
+class TestDirectoryBounds < Minitest::Test
+  include DirectorySessionTest
+
+  def test_subdirectories_are_capped_and_say_so
+    5.times { |i| mkdir("d#{i}") }
+    write("file.txt")
+
+    names, truncated = Directory.subdirectories(@dir, limit: 3)
+    assert_equal 3, names.size
+    assert truncated
+    assert_equal [%w[d0 d1 d2 d3 d4], false], Directory.subdirectories(@dir)
+  end
+
+  def test_subdirectories_stop_scanning_after_the_scan_limit
+    4.times { |i| write("f#{i}.txt") }
+    mkdir("only-dir")
+
+    _, truncated = Directory.subdirectories(@dir, scan: 2)
+    assert truncated
+  end
 end
 
 class TestGuiSessionFind < Minitest::Test
@@ -210,7 +248,7 @@ class TestGuiSessionFind < Minitest::Test
 
   def test_resolves_an_id_to_the_file_in_the_current_directory
     file = write("notes.txt")
-    info = session.find(Gui.encode_id("notes.txt"))
+    info = session.find(session.id_for("notes.txt"))
 
     assert_instance_of FileInfo, info
     assert_equal file, info.path
@@ -218,7 +256,7 @@ class TestGuiSessionFind < Minitest::Test
 
   def test_resolves_a_name_that_is_not_valid_utf8
     name = write_invalid_utf8_name
-    info = session.find(Gui.encode_id(name))
+    info = session.find(session.id_for(name))
 
     refute_nil info
     assert_equal INVALID_UTF8_NAME, info.name.b
@@ -234,9 +272,9 @@ class TestGuiSessionFind < Minitest::Test
 
     ["../secret.txt", "..", ".", outside, "sub/../../secret.txt", "visible.txt/..",
      "visible.txt\0"].each do |name|
-      assert_nil session.find(Gui.encode_id(name)), "name #{name.inspect} was accepted"
+      assert_nil session.find(session.id_for(name)), "name #{name.inspect} was accepted"
     end
-    refute_nil session.find(Gui.encode_id("visible.txt"))
+    refute_nil session.find(session.id_for("visible.txt"))
   end
 
   def test_rejects_ids_that_are_not_ids
@@ -248,30 +286,53 @@ class TestGuiSessionFind < Minitest::Test
 
   def test_rejects_subdirectories
     mkdir("sub")
-    assert_nil session.find(Gui.encode_id("sub"))
+    assert_nil session.find(session.id_for("sub"))
   end
 
   def test_rejects_missing_files_and_pipes
     File.mkfifo(path("pipe"))
-    assert_nil session.find(Gui.encode_id("missing.txt"))
-    assert_nil session.find(Gui.encode_id("pipe"))
+    assert_nil session.find(session.id_for("missing.txt"))
+    assert_nil session.find(session.id_for("pipe"))
   end
 
   def test_accepts_symlinks_including_dangling_ones
     File.symlink(write("target.txt"), path("link"))
     File.symlink(path("nowhere"), path("dangling"))
 
-    assert session.find(Gui.encode_id("link")).symlink?
-    assert session.find(Gui.encode_id("dangling")).symlink?
+    assert session.find(session.id_for("link")).symlink?
+    assert session.find(session.id_for("dangling")).symlink?
   end
 
   def test_find_follows_the_current_directory
     other = mkdir("other")
     write("other/inside.txt")
-    assert_nil session.find(Gui.encode_id("inside.txt"))
+    assert_nil session.find(session.id_for("inside.txt"))
 
     assert_nil session.change_directory(other)
-    assert_equal File.join(other, "inside.txt"), session.find(Gui.encode_id("inside.txt")).path
+    assert_equal File.join(other, "inside.txt"), session.find(session.id_for("inside.txt")).path
+  end
+
+  # Regression: ids were bare names, so a page still showing the old folder
+  # (another tab changed it) deleted a same-named file in the new one.
+  def test_an_id_from_before_a_folder_change_is_stale
+    write("a.txt")
+    other = mkdir("other")
+    write("other/a.txt")
+    old_id = session.id_for("a.txt")
+
+    assert_nil session.change_directory(other)
+    lookup = session.lookup(old_id)
+    assert_equal :stale, lookup.error
+    assert_nil lookup.info
+    refute_equal old_id, session.id_for("a.txt")
+  end
+
+  def test_ids_without_a_valid_generation_are_refused
+    write("a.txt")
+    encoded = Gui.encode_id("a.txt")
+    [encoded, ".#{encoded}", "zz.#{encoded}", "1.#{encoded}.x", "-1.#{encoded}", nil, 42].each do |id|
+      assert_nil session.find(id), id.inspect
+    end
   end
 end
 
@@ -288,11 +349,16 @@ class TestGuiSessionListing < Minitest::Test
     refute listing[:truncated]
   end
 
+  # Only MAX_ENTRIES directory entries are read at all; which ones is up to
+  # the filesystem's order, and they are shown sorted.
   def test_caps_the_listing_at_max_entries
     %w[a b c].each { |name| write("#{name}.txt") }
     listing = with_constant(Gui::Session, :MAX_ENTRIES, 2) { session.listing }
 
-    assert_equal %w[a.txt b.txt], listing[:entries].map(&:name)
+    names = listing[:entries].map(&:name)
+    assert_equal 2, names.size
+    assert_equal names.sort, names
+    assert_empty names - %w[a.txt b.txt c.txt]
     assert listing[:truncated]
     assert_equal 5_000, Gui::Session::MAX_ENTRIES
   end
@@ -308,7 +374,7 @@ class TestGuiSessionListing < Minitest::Test
     mkdir("sub")
     write("file.txt")
 
-    assert_equal %w[sub], session.subdirectories
+    assert_equal [%w[sub], false], session.subdirectories
     assert_equal File.dirname(@dir), session.parent
     assert_nil Gui::Session.new("/").parent
   end
@@ -336,7 +402,7 @@ class TestGuiSessionDetectionCache < Minitest::Test
     session.listing
 
     category = nil
-    assert_equal 0, count_file_opens { category = session.find(Gui.encode_id("image.png")).category }
+    assert_equal 0, count_file_opens { category = session.find(session.id_for("image.png")).category }
     assert_equal :photo, category
   end
 

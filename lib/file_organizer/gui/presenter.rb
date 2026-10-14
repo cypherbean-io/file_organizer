@@ -47,9 +47,10 @@ module FileOrganizer
         nil
       end
 
-      def summary(info)
+      # +id+ is the opaque id the session issued for this file.
+      def summary(info, id:)
         {
-          "id" => Gui.encode_id(info.name),
+          "id" => id,
           "name" => Console.safe(info.name),
           "size" => info.size,
           "modified" => info.mtime.to_i,
@@ -66,8 +67,8 @@ module FileOrganizer
         }
       end
 
-      def detail(info)
-        summary(info).merge(
+      def detail(info, id:)
+        summary(info, id: id).merge(
           "fields" => info.rows.map { |label, value| field(label, value) },
           "sections" => sections(info)
         )

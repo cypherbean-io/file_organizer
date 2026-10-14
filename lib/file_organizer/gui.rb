@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require "securerandom"
+require "fileutils"
+require "tmpdir"
 
 require_relative "gui/request"
 require_relative "gui/response"
@@ -30,11 +32,14 @@ module FileOrganizer
       app = App.new(session: session, token: token, hosts: server.hosts,
                     origin: server.origin, on_quit: -> { server.stop })
 
-      announce(session, server.url("/?t=#{token}"), open_browser)
+      launch_dir = announce(session, server.url("/?t=#{token}"), open_browser)
       server.run(app)
       Console.say("GUI stopped.")
     rescue Errno::EADDRINUSE, Errno::EACCES => e
       abort("file_organizer: could not listen on port #{port}: #{e.message}")
+    ensure
+      session&.stop!
+      FileUtils.remove_entry(launch_dir, true) if launch_dir
     end
 
     # File names travel to the browser and back as opaque ids. A name can be
@@ -68,11 +73,36 @@ module FileOrganizer
       Console.say("  Press Ctrl-C here, or use Quit in the page, to stop.")
       Console.say
       Console.flush
-      return unless open_browser
+      return nil unless open_browser
 
-      Console.say(Viewer.open_url(url) ? "  Opening your browser…" : "  No browser could be launched — open the address above yourself.")
+      launch_dir, page = write_launch_page(url)
+      opened = Viewer.open_in_browser(page)
+      Console.say(opened ? "  Opening your browser…" : "  No browser could be launched — open the address above yourself.")
       Console.say
       Console.flush
+      launch_dir
+    end
+
+    # The address carries the session key, and the command line of a process
+    # can be read by every user on the machine. So the browser is never handed
+    # the address itself: it is handed a page in a directory only this user
+    # can read, which redirects to the address. Returns [directory, page];
+    # the directory is removed when the GUI stops.
+    def write_launch_page(url)
+      dir = Dir.mktmpdir("file_organizer-")
+      page = File.join(dir, "open.html")
+      href = url.gsub("&", "&amp;").gsub('"', "&quot;").gsub("<", "&lt;").gsub(">", "&gt;")
+      File.open(page, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+        file.write(<<~HTML)
+          <!DOCTYPE html>
+          <meta charset="utf-8">
+          <meta name="referrer" content="no-referrer">
+          <meta http-equiv="refresh" content="0;url=#{href}">
+          <title>File Organizer</title>
+          <p><a href="#{href}">Open File Organizer</a></p>
+        HTML
+      end
+      [dir, page]
     end
   end
 end

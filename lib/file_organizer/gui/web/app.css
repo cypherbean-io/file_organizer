@@ -865,7 +865,7 @@ kbd {
 ::-webkit-scrollbar-thumb:hover { background-color: var(--text-faint); background-clip: content-box; }
 
 @media (max-width: 900px) {
-  .brandname, .version { display: none; }
+  .brandname, .version:not(.mode) { display: none; }
   .btn-label { display: none; }
   #act-folder { width: 33px; padding: 0; }
   .layout {

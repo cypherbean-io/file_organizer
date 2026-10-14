@@ -51,8 +51,9 @@ module GuiAppTest
     JSON.parse(response.body)
   end
 
+  # The id the session hands out for +name+ in the folder it is showing now.
   def id(name)
-    Gui.encode_id(name)
+    session.id_for(name)
   end
 
   def listed_names
@@ -270,8 +271,8 @@ class TestGuiAppListing < Minitest::Test
     files = json(get("/api/files"))["files"]
     assert_equal 3, files.size
     files.each do |summary|
-      assert_match Gui::ID_PATTERN, summary["id"]
-      assert_equal summary["name"], Gui.decode_id(summary["id"])
+      assert_match Gui::Session::ID_FORMAT, summary["id"]
+      assert_equal summary["name"], Gui.decode_id(summary["id"].split(".", 2).last)
 
       detail = json(get("/api/file?id=#{summary['id']}"))
       assert_equal summary["name"], detail["name"]
@@ -293,7 +294,7 @@ class TestGuiAppListing < Minitest::Test
 
     files.each do |summary|
       refute_match(/[\p{Cc}\p{Cf}]/, summary["name"])
-      raw = Gui.decode_id(summary["id"])
+      raw = Gui.decode_id(summary["id"].split(".", 2).last)
       assert_includes names.map(&:b), raw.b
 
       hash = json(get("/api/hash?id=#{summary['id']}"))
@@ -465,7 +466,15 @@ class TestGuiAppWrites < Minitest::Test
       assert_equal "old\n", File.read(existing)
     end
 
-    result = json(post("/api/copy", body.merge("overwrite" => true)))
+    # Replacing a file takes the word "yes", as in the terminal.
+    [nil, "y", "YES"].each do |confirm|
+      result = json(post("/api/copy", body.merge("overwrite" => true, "confirm" => confirm).compact))
+      assert_equal "error", result["status"], confirm.inspect
+      assert_includes result["message"], "yes"
+      assert_equal "old\n", File.read(existing)
+    end
+
+    result = json(post("/api/copy", body.merge("overwrite" => true, "confirm" => "yes")))
     assert_equal "ok", result["status"]
     assert_equal id("report.txt"), result["id"]
     assert_equal "new\n", File.read(existing)
@@ -478,7 +487,8 @@ class TestGuiAppWrites < Minitest::Test
     destination = mkdir("dest")
     File.symlink(outside, File.join(destination, "report.txt"))
 
-    result = json(post("/api/copy", { "id" => id("report.txt"), "destination" => destination, "overwrite" => true }))
+    result = json(post("/api/copy", { "id" => id("report.txt"), "destination" => destination,
+                                      "overwrite" => true, "confirm" => "yes" }))
     assert_equal "error", result["status"]
     assert_includes result["message"], "symbolic link"
     assert_equal "must survive\n", File.read(outside)
@@ -732,6 +742,105 @@ class TestGuiAppOpen < Minitest::Test
   end
 end
 
+# Ids carry the folder they were issued for.
+class TestGuiAppStaleIds < Minitest::Test
+  include GuiAppTest
+
+  # Regression: another tab switched the program to a different folder, and
+  # this page's delete then removed a same-named file there.
+  def test_a_page_showing_an_earlier_folder_cannot_act_on_the_new_one
+    write("a.txt", "in the first folder\n")
+    other = mkdir("other")
+    File.binwrite(File.join(other, "a.txt"), "in the second folder\n")
+    old_id = id("a.txt")
+
+    assert_equal "ok", json(post("/api/folder", { "path" => other }))["status"]
+    response = post("/api/delete", { "id" => old_id, "confirm" => "yes" })
+
+    assert_equal 409, response.status
+    assert json(response)["stale"]
+    assert_equal "in the second folder\n", File.read(File.join(other, "a.txt"))
+    assert_path_exists path("a.txt")
+  end
+
+  def test_reads_with_a_stale_id_are_refused_too
+    write("a.txt")
+    old_id = id("a.txt")
+    assert_equal "ok", json(post("/api/folder", { "path" => mkdir("other") }))["status"]
+
+    %w[/api/file /api/text /api/raw /api/hash].each do |route|
+      assert_equal 409, get("#{route}?id=#{old_id}").status, route
+    end
+  end
+
+  def test_the_listing_hands_out_ids_for_the_current_folder
+    write("a.txt")
+    first = json(get("/api/files"))
+    post("/api/folder", { "path" => @dir })
+    second = json(get("/api/files"))
+
+    refute_equal first["generation"], second["generation"]
+    refute_equal first["files"].first["id"], second["files"].first["id"]
+    assert_equal "a.txt", json(get("/api/file?id=#{second['files'].first['id']}"))["name"]
+  end
+end
+
+class TestGuiAppChecksums < Minitest::Test
+  include GuiAppTest
+
+  def test_a_checksum_is_computed_once_and_remembered
+    file = write("data.bin", "x" * 10_000)
+    reads = 0
+    sha = SafeFile.method(:sha256)
+    result = SafeFile.stub(:sha256, ->(*args, **opts) { reads += 1; sha.call(*args, **opts) }) do
+      2.times.map { json(get("/api/hash?id=#{id('data.bin')}")) }
+    end
+
+    assert_equal [Digest::SHA256.file(file).hexdigest] * 2, result.map { |r| r["sha256"] }
+    assert_equal 1, reads
+  end
+
+  def test_asking_again_while_it_runs_does_not_start_a_second_read
+    write("data.bin", "x")
+    started = Queue.new
+    release = Queue.new
+    slow = lambda do |*, **|
+      started << true
+      release.pop
+      "f" * 64
+    end
+    SafeFile.stub(:sha256, slow) do
+      first = Thread.new { json(get("/api/hash?id=#{id('data.bin')}")) }
+      started.pop
+      second = json(get("/api/hash?id=#{id('data.bin')}"))
+      release << true
+
+      assert_equal "error", second["status"]
+      assert_includes second["message"], "already being computed"
+      assert_equal "ok", first.value["status"]
+    end
+  end
+
+  def test_a_changed_file_is_checksummed_again
+    file = write("data.bin", "one")
+    first = json(get("/api/hash?id=#{id('data.bin')}"))["sha256"]
+    File.binwrite(file, "two!")
+    second = json(get("/api/hash?id=#{id('data.bin')}"))["sha256"]
+
+    assert_equal Digest::SHA256.hexdigest("two!"), second
+    refute_equal first, second
+  end
+
+  def test_stopping_abandons_a_checksum_in_progress
+    write("data.bin", "x" * ((1 << 20) * 3))
+    session.stop!
+    result = json(get("/api/hash?id=#{id('data.bin')}"))
+
+    assert_equal "error", result["status"]
+    assert_includes result["message"], "Stopped"
+  end
+end
+
 class TestGuiAppFolder < Minitest::Test
   include GuiAppTest
 
@@ -758,6 +867,24 @@ class TestGuiAppFolder < Minitest::Test
       assert_equal "confirm", change(guarded, "confirm" => "y")["status"], guarded
       assert_equal @dir, session.directory
     end
+  end
+
+  # Regression: "//etc" is /etc, but the check compared the text, and a
+  # link to /etc was only compared by its own name.
+  def test_a_system_folder_spelled_with_a_doubled_slash_still_needs_confirmation
+    ["//etc", "///etc", "//"].each do |guarded|
+      result = change(guarded)
+      assert_equal "confirm", result["status"], guarded
+      assert_equal @dir, session.directory, guarded
+    end
+  end
+
+  def test_a_symlink_to_a_system_folder_still_needs_confirmation
+    File.symlink("/etc", path("settings"))
+    result = change(path("settings"))
+
+    assert_equal "confirm", result["status"]
+    assert_equal @dir, session.directory
   end
 
   def test_a_system_folder_is_entered_once_confirmed
@@ -979,6 +1106,7 @@ class TestGuiAppSession < Minitest::Test
 
     result = json(post("/api/quit"))
     assert_equal "ok", result["status"]
+    assert session.stopped?, "long-running work is told to give up at once"
 
     thread = stopped.pop(timeout: 5)
     refute_nil thread, "on_quit was never called"

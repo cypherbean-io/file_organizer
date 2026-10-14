@@ -33,15 +33,14 @@ module FileOrganizer
 
     # Returns [entries, truncated?] where entries are FileInfo objects for the
     # regular files and symlinks in +directory+, sorted by name. With +limit+
-    # only that many directory entries are looked at, so a directory with an
-    # absurd number of them cannot exhaust memory.
+    # only that many directory entries are read at all, so a directory with an
+    # absurd number of them costs no more than one with +limit+; which ones
+    # are shown is then up to the order the filesystem returns them in.
     #
     # One lstat per entry: no file's content is read until something asks for
     # it.
     def entries(directory, limit: nil)
-      names = children(directory)
-      truncated = !limit.nil? && names.size > limit
-      names = names.first(limit) if truncated
+      names, truncated = children(directory, limit: limit)
       infos = names.filter_map do |name|
         info = FileInfo.new(File.join(directory, name))
         info if info.regular? || info.symlink?
@@ -51,27 +50,56 @@ module FileOrganizer
       [infos, truncated]
     end
 
-    def subdirectories(directory)
-      children(directory).filter_map do |name|
-        path = File.join(directory, name)
-        name if File.directory?(path) && !File.symlink?(path)
+    # Returns [names, truncated?]: the real subdirectories (not links to
+    # one), sorted. At most +scan+ entries are examined and +limit+ names
+    # returned, so a folder of millions of files stays cheap to describe.
+    def subdirectories(directory, limit: 500, scan: 20_000)
+      names, scan_truncated = children(directory, limit: scan)
+      found = names.select do |name|
+        File.lstat(File.join(directory, name)).directory?
       rescue SystemCallError
-        nil
+        false
+      end
+      [found.first(limit), scan_truncated || found.size > limit]
+    end
+
+    # Returns [names, truncated?], sorted with a byte-wise key: a file name
+    # that is not valid UTF-8 (which the filesystem happily allows) would make
+    # String#downcase raise. With +limit+, reading stops after that many.
+    def children(directory, limit: nil)
+      names = []
+      truncated = false
+      Dir.each_child(directory) do |name|
+        if limit && names.size >= limit
+          truncated = true
+          break
+        end
+        names << name
+      end
+      [names.sort_by { |name| [name.b.downcase, name.b] }, truncated]
+    rescue SystemCallError
+      [[], false]
+    end
+
+    # Compared both as written — with repeated separators collapsed, since
+    # "//etc" is /etc — and as it resolves, so a symlink to /etc is /etc too.
+    def guarded?(directory)
+      [directory, resolve(directory)].compact.uniq.any? do |path|
+        guarded_path?(path.squeeze(File::SEPARATOR))
       end
     end
 
-    # Sorted with a byte-wise key: a file name that is not valid UTF-8 (which
-    # the filesystem happily allows) would make String#downcase raise.
-    def children(directory)
-      Dir.children(directory).sort_by { |name| [name.b.downcase, name.b] }
-    rescue SystemCallError
-      []
+    def guarded_path?(path)
+      return true if path == File::SEPARATOR
+      return true if [home, resolve(home)].compact.include?(path)
+
+      GUARDED.any? { |root| path == root || path.start_with?("#{root}/") }
     end
 
-    def guarded?(directory)
-      return true if directory == "/" || directory == home
-
-      GUARDED.any? { |root| directory == root || directory.start_with?("#{root}/") }
+    def resolve(path)
+      path && File.realpath(path)
+    rescue SystemCallError, ArgumentError
+      nil
     end
 
     def home

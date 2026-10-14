@@ -10,10 +10,17 @@ module FileOrganizer
     TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
     # Extensions the platform openers treat as "run this", whatever the bytes
-    # inside happen to look like.
+    # inside happen to look like: Windows programs, scripts the Windows
+    # Script Host runs (.js and .jse among them), shortcuts, consoles, help
+    # files and disk images that mount and autorun; macOS and Linux launchers,
+    # installers and Terminal settings that carry a command.
     LAUNCHABLE_EXTENSIONS = %w[
-      .desktop .lnk .url .scf .hta .reg .exe .com .bat .cmd .ps1 .psm1 .msi
-      .scr .pif .vbs .vbe .wsf .wsh .jar .app .command .scpt .workflow
+      .exe .com .scr .pif .cpl .msi .msp .msc .bat .cmd .ps1 .psm1 .psd1
+      .vbs .vbe .js .jse .wsf .wsh .wsc .sct .hta .reg .scf .lnk .url .chm
+      .application .appref-ms .settingcontent-ms .library-ms .search-ms
+      .searchconnector-ms .xll .iso .img .vhd .vhdx .jar
+      .desktop .app .command .tool .terminal .workflow .scpt .fileloc
+      .inetloc .webloc .pkg .mpkg .dmg
     ].map(&:b).freeze
 
     attr_reader :path, :name

@@ -66,6 +66,20 @@ class TestOpenGuards < Minitest::Test
     refute openable?("LOUD.DESKTOP", "[Desktop Entry]\n")
   end
 
+  # Text that a script host or a desktop runs when it is "opened".
+  def test_script_and_launcher_types_the_content_check_cannot_see_are_refused
+    {
+      "invoice.js" => %(var s=new ActiveXObject("WScript.Shell");\n),
+      "invoice.JSE" => "encoded\n",
+      "tool.msc" => "<?xml version=\"1.0\"?><MMC_ConsoleFile/>\n",
+      "x.terminal" => "<?xml version=\"1.0\"?><plist/>\n",
+      "x.fileloc" => "<?xml version=\"1.0\"?><plist/>\n",
+      "s.settingcontent-ms" => "<PCSettings/>\n",
+      "disk.iso" => "plain\n"
+    }.each { |name, content| refute openable?(name, content), name }
+    assert openable?("readme.md", "# hello\n")
+  end
+
   def test_a_symlink_is_never_handed_to_the_opener
     File.symlink(write("real.txt"), path("link.txt"))
     refute FileInfo.new(path("link.txt")).openable?
@@ -200,5 +214,21 @@ class TestChecksum < Minitest::Test
     File.symlink(write("real.bin", "content"), path("link"))
 
     assert_raises(SystemCallError) { checksum(path("link")) }
+  end
+
+  def test_stops_when_asked
+    file = write("big.bin", "a" * ((1 << 20) * 2))
+    assert_nil SafeFile.sha256(file, stop: -> { true })
+  end
+
+  # A named pipe swapped in after the lstat used to park the reader forever
+  # once some process held it open; it is now refused on sight.
+  def test_refuses_anything_but_a_regular_file
+    File.mkfifo(path("pipe"))
+    writer = File.open(path("pipe"), File::RDWR)
+    error = assert_raises(SystemCallError) { SafeFile.read(path("pipe"), 16) }
+    assert_includes error.message, "not a regular file"
+  ensure
+    writer&.close
   end
 end

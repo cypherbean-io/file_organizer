@@ -136,10 +136,12 @@ module FileOrganizer
       end
 
       def session_payload
+        subdirectories, more = @session.subdirectories
         Response.json({
                         "directory" => Console.safe(@session.directory),
                         "parent" => @session.parent && Console.safe(@session.parent),
-                        "subdirectories" => @session.subdirectories.map { |name| directory_entry(name) },
+                        "subdirectories" => subdirectories.map { |name| directory_entry(name) },
+                        "moreSubdirectories" => more,
                         "mode" => @session.mode.to_s,
                         "readOnly" => @session.read_only?,
                         "dryRun" => @session.dry_run?,
@@ -154,16 +156,22 @@ module FileOrganizer
 
       def files_payload
         listing = @session.listing
+        generation = listing[:generation]
         Response.json({
                         "directory" => Console.safe(listing[:directory]),
+                        "generation" => generation,
                         "truncated" => listing[:truncated],
                         "limit" => Session::MAX_ENTRIES,
-                        "files" => listing[:entries].map { |info| Presenter.summary(info) }
+                        "files" => listing[:entries].map do |info|
+                          Presenter.summary(info, id: @session.id_for(info.name, generation))
+                        end
                       })
       end
 
       def file_payload(request)
-        with_file(request) { |info| Response.json(Presenter.detail(info)) }
+        with_file(request) do |info, generation|
+          Response.json(Presenter.detail(info, id: @session.id_for(info.name, generation)))
+        end
       end
 
       def text_payload(request)
@@ -192,7 +200,12 @@ module FileOrganizer
         with_file(request) do |info|
           next failure("Checksums are only available for regular files.") unless info.regular?
 
-          Response.json({ "status" => "ok", "sha256" => SafeFile.sha256(info.path) })
+          status, digest = @session.checksum(info)
+          case status
+          when :ok then Response.json({ "status" => "ok", "sha256" => digest })
+          when :busy then failure("The checksum of this file is already being computed — it will appear when ready.")
+          else failure("Stopped before the checksum was finished.")
+          end
         rescue SystemCallError, IOError => e
           failure("Could not compute checksum: #{e.message}")
         end
@@ -201,32 +214,39 @@ module FileOrganizer
       # --- writes -------------------------------------------------------------
 
       def rename(request)
-        with_file(request) do |info|
+        with_file(request) do |info, generation|
           new_name = request.string("name").to_s
           next failure("A new name is required.") if new_name.empty?
 
-          report(Operations.rename(info.path, new_name, dry_run: @session.dry_run?))
+          report(Operations.rename(info.path, new_name, dry_run: @session.dry_run?), generation)
         end
       end
 
+      # Replacing a file that is already there cannot be undone, so — as in
+      # the terminal — it takes the word "yes", checked here and not only in
+      # the page.
       def transfer(request, operation)
-        with_file(request) do |info|
+        with_file(request) do |info, generation|
           destination = request.string("destination").to_s
           next failure("A destination folder is required.") if destination.empty?
 
+          overwrite = request.json["overwrite"] == true
+          if overwrite && request.string("confirm") != "yes"
+            next failure("Overwriting needs the word 'yes' as confirmation.")
+          end
+
           report(Operations.transfer(info.path, destination, operation,
-                                     overwrite: request.json["overwrite"] == true,
-                                     dry_run: @session.dry_run?))
+                                     overwrite: overwrite, dry_run: @session.dry_run?), generation)
         end
       end
 
       # The typed confirmation is enforced here, not only in the page: nothing
       # is deleted unless the request says so in as many words.
       def delete(request)
-        with_file(request) do |info|
+        with_file(request) do |info, generation|
           next failure("Deleting needs the word 'yes' as confirmation.") unless request.string("confirm") == "yes"
 
-          report(Operations.delete(info.path, dry_run: @session.dry_run?))
+          report(Operations.delete(info.path, dry_run: @session.dry_run?), generation)
         end
       end
 
@@ -277,6 +297,7 @@ module FileOrganizer
 
       def quit
         # Answer first, stop a moment later, so the page can say goodbye.
+        @session.stop!
         Thread.new do
           sleep(0.25)
           @on_quit&.call
@@ -286,24 +307,34 @@ module FileOrganizer
 
       # --- helpers ------------------------------------------------------------
 
-      # Resolves the requested file once and hands it to the block, so no
-      # handler ever sees a client-supplied path.
+      # Resolves the requested file once and hands it, with the folder
+      # generation its id was issued in, to the block, so no handler ever sees
+      # a client-supplied path.
       def with_file(request)
-        info = @session.find(request.param("id") || request.string("id"))
-        return missing_file if info.nil?
+        lookup = @session.lookup(request.param("id") || request.string("id"))
+        return stale_file if lookup.error == :stale
+        return missing_file if lookup.info.nil?
 
-        yield info
+        yield lookup.info, lookup.generation
       end
 
       def missing_file
         Response.json({ "status" => "error", "message" => "That file is no longer there." }, status: 404)
       end
 
-      def report(result)
+      # The page is showing a folder the program has since left (another tab
+      # changed it). Acting on the id now would hit a different file.
+      def stale_file
+        Response.json({ "status" => "error", "stale" => true,
+                        "message" => "The folder changed since this page loaded it — showing it again now." },
+                      status: 409)
+      end
+
+      def report(result, generation)
         Response.json({
                         "status" => result.status.to_s,
                         "message" => Console.safe(result.message),
-                        "id" => result.path && Gui.encode_id(File.basename(result.path))
+                        "id" => result.path && @session.id_for(File.basename(result.path), generation)
                       })
       end
 

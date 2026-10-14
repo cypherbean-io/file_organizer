@@ -27,13 +27,13 @@ module FileOrganizer
       !!system(*command)
     end
 
-    # Hands a loopback URL to the system browser, again as an argument vector.
-    # The address is built by the program itself, and checked here anyway so
-    # this can never become a way to launch something else.
-    def open_url(url)
-      return false unless url.start_with?("http://127.0.0.1:")
+    # Hands the GUI's launch page (see Gui.write_launch_page) to the system
+    # browser, again as an argument vector, and quietly: the browser's own
+    # chatter does not belong in the terminal.
+    def open_in_browser(page)
+      return false unless File.extname(page) == ".html"
 
-      command = opener_command(url)
+      command = opener_command(File.expand_path(page))
       return false if command.nil?
 
       !!system(*command, out: File::NULL, err: File::NULL)

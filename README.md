@@ -103,9 +103,11 @@ The page shows the whole folder at once:
   `?` for the list. Dark and light themes follow the system and can be
   toggled.
 
-A folder lists at most its first 5,000 entries in the page (the terminal
-has no such cap). A file's content is examined once and remembered until the
-file changes, so refreshing a large folder stays quick.
+The page lists at most 5,000 entries of a folder — once there are more, it
+says so, and which 5,000 follows the order the filesystem returns them in
+(the terminal has no such cap). A file's content, and its checksum, are
+examined once and remembered until the file changes, so refreshing a large
+folder stays quick.
 
 Images are sent to the browser at full size — there is no image processing
 in the standard library to make thumbnails with — so a folder of very large
@@ -201,7 +203,9 @@ of rules:
   the network, and there is still no outbound network code anywhere.
 - **A one-time key** — every page and API request must carry the key printed
   in the terminal, so another program on the machine cannot drive the
-  interface. It is new on every run and lives only in memory.
+  interface. It is new on every run and lives only in memory. The browser is
+  never handed the address on its command line, which every user on the
+  machine can read: it is handed a private page that redirects to it.
 - **Host and Origin checks** — requests must name our own loopback address
   (which defeats DNS rebinding), and anything the browser labels as
   cross-origin or cross-site is refused even if it has the key.
@@ -210,8 +214,10 @@ of rules:
   serves; the page cannot be framed and cannot submit a form anywhere.
 - **Files addressed by opaque id, never by path** — an id decodes to a
   single file name inside the folder being reviewed, so a crafted request
-  cannot reach anywhere else. (It also means names that are not valid UTF-8
-  survive the round trip.)
+  cannot reach anywhere else. An id also names the folder it was handed out
+  for: once another tab has moved the program to a different folder, a page
+  still showing the old one cannot act on a same-named file in the new one.
+  (Ids also let names that are not valid UTF-8 survive the round trip.)
 - **Only media is ever served to the page** — image, audio and video bytes,
   for formats detected by content and streamed in bounded ranges. SVG and
   PDF are deliberately not rendered in the page, so nothing that could carry
@@ -220,11 +226,10 @@ of rules:
 - **Names and metadata are inserted as text, never as markup** — a file
   cannot inject anything into the page, just as it cannot inject terminal
   escape sequences into the terminal.
-- **The same confirmations** — deleting requires typing `yes`, which the
-  server checks too (a request without it is refused, whatever the page
-  does). Overwriting, opening a file whose extension disagrees with its
-  content, and switching to a system or home folder each require an explicit
-  confirmation, and the server refuses all three without one.
+- **The same confirmations** — deleting, overwriting, opening a file whose
+  extension disagrees with its content, and switching to a system or home
+  folder each require typing `yes`, exactly as in the terminal. The server
+  checks it too: a request without it is refused, whatever the page does.
 - **The same modes** — `--read-only` and `--dry-run` work with `--gui`. In
   read-only mode the server refuses every request that would rename, copy,
   move, delete or open a file, whatever the page sends; in a dry run each
