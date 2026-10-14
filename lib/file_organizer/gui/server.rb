@@ -27,6 +27,10 @@ module FileOrganizer
       SHUTDOWN_SECONDS = 3    # what requests still being answered get, in all, on stop
       POLL_SECONDS = 1.0      # the longest the event loop sleeps between deadline checks
       ACCEPT_BACKOFF = 0.1    # how long to leave the listener alone when out of descriptors
+      # Descriptors kept back from connections for the listener, the wake-up
+      # pipe, the standard streams, the files being streamed and whatever else
+      # the program opens. A quarter of a very low limit, at most this many.
+      FD_RESERVE = 64
       STREAM_CHUNK = 64 * 1024
 
       STATUS_TEXT = {
@@ -58,7 +62,7 @@ module FileOrganizer
         @read_timeout = read_timeout
         @write_timeout = write_timeout
         @keep_alive = keep_alive
-        @max_connections = max_connections
+        @max_connections = within_descriptor_limit(max_connections)
         @shutdown_timeout = shutdown_timeout
         @lock = Mutex.new
         @open = {}             # every open connection, wherever it is (guarded by @lock)
@@ -115,6 +119,19 @@ module FileOrganizer
 
       private
 
+      # The connection limit only protects anyone if it is reached before the
+      # process runs out of descriptors: past that, accept fails before any
+      # idle connection is asked to make way, and the page is locked out. On
+      # macOS a shell's default limit is 256, so the limit is cut to fit.
+      def within_descriptor_limit(requested)
+        return requested unless defined?(Process::RLIMIT_NOFILE) # Windows has no such limit
+
+        soft, = Process.getrlimit(Process::RLIMIT_NOFILE)
+        [requested, soft - [FD_RESERVE, soft / 4].min].min
+      rescue NotImplementedError, SystemCallError
+        requested
+      end
+
       # Waits on the listener, the wake-up pipe and every parked socket at once.
       def event_loop
         while @running
@@ -148,13 +165,23 @@ module FileOrganizer
       def accept_connection
         socket = @listener.accept_nonblock(exception: false)
         admit(socket) unless socket == :wait_readable
-      rescue Errno::EMFILE, Errno::ENFILE, Errno::ENOBUFS, Errno::ENOMEM
-        # The connection stays in the backlog, so the listener stays readable
-        # and selecting it again at once would spin a core until a descriptor
-        # frees up. Leave it out of the set for a moment instead.
-        @accept_paused_until = now + ACCEPT_BACKOFF
+      rescue Errno::EMFILE, Errno::ENFILE
+        # Out of descriptors short of the connection limit — something else
+        # holds more of them than was reserved. As at the limit, the connection
+        # idle the longest makes way, and the newcomer, still in the backlog, is
+        # accepted on the next pass.
+        evict_idlest || pause_accepting
+      rescue Errno::ENOBUFS, Errno::ENOMEM
+        pause_accepting
       rescue IOError, SystemCallError
         nil
+      end
+
+      # The connection stays in the backlog, so the listener stays readable and
+      # selecting it again at once would spin a core until accepting can work.
+      # It is left out of the set for a moment instead.
+      def pause_accepting
+        @accept_paused_until = now + ACCEPT_BACKOFF
       end
 
       # Every connection counts against one limit, so neither the sockets the

@@ -228,6 +228,29 @@ class TestGuiServerAcceptBackoff < Minitest::Test
     socket.write(request("GET", "/after"))
     assert_equal "GET /after\n", read_reply(socket).body
   end
+
+  # Regression: out of descriptors short of the connection limit, accept only
+  # backed off, so idle connections kept the page out until they timed out.
+  def test_running_out_of_descriptors_makes_the_connection_idle_longest_make_way
+    idle = Array.new(2) do |index|
+      reply, socket = exchange(request("GET", "/idle-#{index}"))
+      assert_equal 200, reply.status
+      sleep 0.02 # so each has been idle a different length of time
+      socket
+    end
+    # One descriptor short, once: the next accept is the real one.
+    listener = @server.instance_variable_get(:@listener)
+    listener.define_singleton_method(:accept_nonblock) do |*|
+      singleton_class.remove_method(:accept_nonblock)
+      raise Errno::EMFILE
+    end
+
+    assert_equal "GET /new\n", exchange(request("GET", "/new")).first.body
+    assert idle.first.wait_readable(1) && closed_by_server?(idle.first),
+           "the connection idle longest should have made way"
+    idle.last.write(request("GET", "/again"))
+    assert_equal "GET /again\n", read_reply(idle.last).body
+  end
 end
 
 class TestGuiServerShutdown < Minitest::Test
@@ -307,5 +330,68 @@ class TestGuiServerShutdown < Minitest::Test
     assert_equal :interrupted, @thread.value
     assert closed_by_server?(socket)
     assert_raises(Errno::ECONNREFUSED) { TCPSocket.new(Gui::Server::HOST, @server.port).close }
+  end
+end
+
+# The server in a process of its own, under a low descriptor limit such as the
+# 256 a macOS shell starts with.
+class TestGuiServerDescriptorLimit < Minitest::Test
+  LIMIT = 128
+  LIB = File.expand_path("../lib/file_organizer", __dir__)
+  MEDIA = File.expand_path("../lib/file_organizer/gui.rb", __dir__)
+
+  # Streams MEDIA for /media and echoes anything else; stops when the test
+  # closes its standard input.
+  SERVER = <<~RUBY
+    require #{LIB.dump}
+    require #{"#{LIB}/gui".dump}
+    server = FileOrganizer::Gui::Server.new(port: 0).start
+    $stdout.puts(server.port)
+    $stdout.flush
+    Thread.new { $stdin.read; server.stop }
+    server.run(lambda do |request|
+      next FileOrganizer::Gui::Response.text(request.target) unless request.path == "/media"
+
+      size = File.size(#{MEDIA.dump})
+      FileOrganizer::Gui::Response.file(#{MEDIA.dump}, content_type: "text/plain", offset: 0, length: size, total: size)
+    end)
+  RUBY
+
+  # Regression: the connection limit (256) was above what the process could
+  # open, so accept ran out of descriptors before any idle connection was
+  # asked to make way, and a client holding a few hundred idle sockets — no
+  # key needed — locked the page out. Out of descriptors, the workers could
+  # not open the files they were asked to stream either.
+  def test_idle_connections_cannot_use_up_a_low_descriptor_limit
+    skip "no descriptor limit on this platform" unless defined?(Process::RLIMIT_NOFILE)
+
+    sockets = []
+    IO.popen([RbConfig.ruby, "-e", SERVER], "r+", rlimit_nofile: [LIMIT, LIMIT]) do |server|
+      port = Integer(server.gets)
+      (LIMIT + 32).times { sockets << TCPSocket.new(FileOrganizer::Gui::Server::HOST, port) }
+      sockets << (browser = TCPSocket.new(FileOrganizer::Gui::Server::HOST, port))
+
+      browser.write(get("/page", port))
+      assert browser.wait_readable(3), "idle connections locked the page out"
+      assert_equal ["200", "/page\n"], reply(browser)
+      browser.write(get("/media", port))
+      assert_equal ["200", File.binread(MEDIA)], reply(browser), "no descriptor was left to open the file"
+    ensure
+      sockets.each(&:close)
+      server.close_write
+    end
+    assert_predicate $?, :success?
+  end
+
+  private
+
+  def get(target, port)
+    "GET #{target} HTTP/1.1\r\nHost: 127.0.0.1:#{port}\r\n\r\n"
+  end
+
+  # [status, body] of one response.
+  def reply(socket)
+    head = socket.gets("\r\n\r\n")
+    [head[%r{\AHTTP/1\.1 (\d+)}, 1], socket.read(Integer(head[/^Content-Length: (\d+)/i, 1]))]
   end
 end
