@@ -34,29 +34,88 @@ module ServerHarness
     super
     @sockets = []
     @app = StubApp.new
-    @server = Gui::Server.new(port: 0).start
-    @thread = Thread.new { @server.run(@app) }
+    @threads_before = Thread.list
+    @descriptors_before = open_descriptors
+    @server = Gui::Server.new(port: 0, **server_options).start
+    @thread = Thread.new do
+      @server.run(@app)
+      :stopped
+    rescue Interrupt # what Ctrl-C raises in the thread running the server
+      :interrupted
+    end
+  end
+
+  # Test classes that need tighter limits than the defaults override this.
+  def server_options
+    {}
   end
 
   def teardown
-    # Clients first, so a worker still waiting on a half-sent request sees
-    # end-of-file at once instead of holding up the server's shutdown.
+    # Clients first, so a worker still writing to one fails at once instead of
+    # holding up the server's shutdown.
     @sockets.each { |socket| socket.close unless socket.closed? }
     @server.stop
     stopped = @thread.join(5)
     @thread.kill unless stopped
+    lingering = threads_left_running
     super
     assert stopped, "the server thread did not stop within 5 s"
+    assert_empty lingering, "threads outlived the server"
+    return if @descriptors_before.nil?
+
+    assert_operator open_descriptors, :<=, @descriptors_before, "file descriptors leaked"
+  end
+
+  # A worker still finishing its last job may outlive run by a moment.
+  def threads_left_running(seconds = 2)
+    deadline = now + seconds
+    loop do
+      alive = Thread.list - @threads_before
+      return alive if alive.empty? || now > deadline
+
+      sleep 0.01
+    end
+  end
+
+  def open_descriptors
+    Dir.children("/proc/self/fd").size if File.directory?("/proc/self/fd")
+  end
+
+  def now
+    Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  end
+
+  def wait_until(what, seconds = 3)
+    deadline = now + seconds
+    until yield
+      flunk("timed out waiting until #{what}") if now > deadline
+      sleep 0.01
+    end
   end
 
   def respond(&handler)
     @app.handler = handler
   end
 
+  # Streams +file+ for /media and echoes anything else, so a follow-up request
+  # can show the connection is still in step.
+  def serve_file(file, offset:, length:, total:)
+    respond do |request|
+      next Gui::Response.text("next") unless request.path == "/media"
+
+      Gui::Response.file(file, content_type: "application/octet-stream", offset: offset, length: length, total: total)
+    end
+  end
+
   def connect
     socket = TCPSocket.new(Gui::Server::HOST, @server.port)
+    track(socket)
+  end
+
+  def track(socket)
     socket.binmode
-    socket.timeout = 5 # a hung server fails the test instead of hanging it
+    # A hung server fails the test instead of hanging it (IO#timeout is 3.2+).
+    socket.timeout = 5 if socket.respond_to?(:timeout=)
     @sockets << socket
     socket
   end
@@ -102,8 +161,11 @@ module ServerHarness
     true
   end
 
+  # The app records a request before answering it, so once the reply is in,
+  # so is the request.
   def received
-    @app.requests.pop(timeout: 1)
+    wait_until("the app has a request", 1) { !@app.requests.empty? }
+    @app.requests.pop
   end
 end
 
@@ -178,6 +240,21 @@ class TestGuiServerHttp < Minitest::Test
     assert_equal "GET /first\n", first.body
     assert_equal "GET /second\n", second.body
     assert_equal "keep-alive", first.headers["connection"]
+    assert_equal "keep-alive", second.headers["connection"]
+  end
+
+  # Regression: with the head and body written separately and Nagle's
+  # algorithm on, every response on a reused connection waited ~40 ms for the
+  # client's delayed ACK — 20 requests took most of a second.
+  def test_responses_on_a_reused_connection_are_not_held_back
+    socket = connect
+    started = now
+    20.times do |index|
+      socket.write(request("GET", "/#{index}"))
+      assert_equal "GET /#{index}\n", read_reply(socket).body
+    end
+
+    assert_operator now - started, :<, 0.5
   end
 
   # Regression: a pipelined request is already in the connection's buffer, so
@@ -201,6 +278,7 @@ class TestGuiServerHttp < Minitest::Test
 
       assert_equal 200, reply.status
       assert_equal "GET /bye\n", reply.body
+      assert_equal "close", reply.headers["connection"]
       assert closed_by_server?(socket), "Connection: #{value} must close the connection"
     end
   end
@@ -210,9 +288,11 @@ class TestGuiServerHttp < Minitest::Test
     limit = Gui::Server::MAX_REQUESTS_PER_CONNECTION
     # Pipelined in one write, so the test does not pay a round trip per request.
     socket.write(Array.new(limit) { |index| request("GET", "/#{index}") }.join)
-    bodies = Array.new(limit) { read_reply(socket).body }
+    replies = Array.new(limit) { read_reply(socket) }
 
-    assert_equal Array.new(limit) { |index| "GET /#{index}\n" }, bodies
+    assert_equal Array.new(limit) { |index| "GET /#{index}\n" }, replies.map(&:body)
+    assert_equal ["keep-alive"], replies[0...-1].map { |reply| reply.headers["connection"] }.uniq
+    assert_equal "close", replies.last.headers["connection"], "the last response must announce the close"
     assert closed_by_server?(socket), "the connection outlived MAX_REQUESTS_PER_CONNECTION"
   end
 
@@ -262,6 +342,7 @@ class TestGuiServerRequestLimits < Minitest::Test
     assert_equal status, reply.status
     assert_equal Gui::Server::STATUS_TEXT.fetch(status), reply.reason
     assert_match message, reply.body
+    assert_equal "close", reply.headers["connection"]
     assert closed_by_server?(socket), "a refused request must close its connection"
     assert @app.requests.empty?, "a refused request must never reach the app"
     reply
@@ -295,9 +376,43 @@ class TestGuiServerRequestLimits < Minitest::Test
     assert_refused("GET /#{"a" * (Gui::Connection::MAX_LINE_BYTES + 1)}", 431, /too long/)
   end
 
+  # Regression: the length was checked only while no newline was buffered, so
+  # an over-long line that arrived in one read, newline and all, got through.
+  def test_over_long_lines_arriving_whole_are_refused
+    long = "a" * (Gui::Connection::MAX_LINE_BYTES * 3)
+    assert_refused(request(headers: { "X-Big" => long }), 431, /too long/)
+    assert_refused(request("GET", "/#{long}"), 431, /too long/)
+  end
+
+  # The limit counts every byte before the newline, the CR included.
+  def test_a_line_of_exactly_8_kib_is_accepted_and_one_byte_more_is_not
+    value = "a" * (Gui::Connection::MAX_LINE_BYTES - "X-Edge: \r".bytesize)
+    reply, = exchange(request(headers: { "X-Edge" => value }))
+
+    assert_equal 200, reply.status
+    assert_equal value, received.header("x-edge")
+    assert_refused(request(headers: { "X-Edge" => "#{value}a" }), 431, /too long/)
+  end
+
+  # Every line may be within its limit and the head still too big in all.
+  def test_headers_over_64_kib_in_all_are_refused
+    headers = (1..9).to_h { |index| ["X-Part-#{index}", "a" * 8000] }
+    assert_refused(request(headers: headers), 431, /headers too large/)
+  end
+
   def test_more_than_64_headers_are_refused
     headers = (1..64).to_h { |index| ["X-Header-#{index}", "v"] } # 65 with Host
     assert_refused(request(headers: headers), 431, /Too many request headers/)
+  end
+
+  # Regression: the blank line that ends the headers used up one of the 64
+  # turns, so exactly 64 headers were refused.
+  def test_exactly_64_headers_are_accepted
+    headers = (1..63).to_h { |index| ["X-Header-#{index}", "v"] } # 64 with Host
+    reply, = exchange(request(headers: headers))
+
+    assert_equal 200, reply.status
+    assert_equal 64, received.headers.size
   end
 
   def test_a_modest_number_of_headers_is_accepted
@@ -347,6 +462,7 @@ class TestGuiServerRequestLimits < Minitest::Test
 
     assert_equal 400, reply.status
     assert_match(/Truncated request body/, reply.body)
+    assert_equal "close", reply.headers["connection"]
     assert @app.requests.empty?
   end
 
@@ -378,11 +494,11 @@ class TestGuiServerConcurrency < Minitest::Test
     stalled = Array.new(Gui::Server::WORKERS - 1) do |index|
       connect.tap { |socket| socket.write("GET /stalled-#{index} HTTP/1.1\r\nHost: 127.0.0.1\r\n") }
     end
-    sleep 0.2 # let the event loop hand each stalled request to a worker
+    sleep 0.2 # let the event loop take in each partial request
 
-    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    started = now
     reply, = exchange(request("GET", "/fast"))
-    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+    elapsed = now - started
 
     assert_equal "GET /fast\n", reply.body
     assert_operator elapsed, :<, 2, "another client was kept waiting behind stalled ones"
@@ -423,6 +539,7 @@ class TestGuiServerConcurrency < Minitest::Test
     reply, socket = exchange(request("POST", "/api/quit", body: "{}"))
 
     assert_equal "bye\n", reply.body
+    assert_equal "close", reply.headers["connection"], "a stopping server takes no further request"
     assert closed_by_server?(socket)
     assert @thread.join(5), "run did not return after stop"
     assert_raises(Errno::ECONNREFUSED) { TCPSocket.new(Gui::Server::HOST, @server.port).close }
@@ -441,16 +558,6 @@ end
 
 class TestGuiServerStreaming < Minitest::Test
   include ServerHarness
-
-  # Streams +file+ for /media and echoes anything else, so a follow-up request
-  # can show the connection is still in step.
-  def serve_file(file, offset:, length:, total:)
-    respond do |request|
-      next Gui::Response.text("next") unless request.path == "/media"
-
-      Gui::Response.file(file, content_type: "application/octet-stream", offset: offset, length: length, total: total)
-    end
-  end
 
   def test_streams_exactly_the_requested_byte_range
     content = (0..255).map(&:chr).join.b * 4
@@ -480,6 +587,21 @@ class TestGuiServerStreaming < Minitest::Test
     assert_equal content, reply.body
     socket.write(request("GET", "/next"))
     assert_equal "next\n", read_reply(socket).body
+  end
+
+  # The head and the file go out in separate writes, so without TCP_NODELAY
+  # the file would wait for the client's delayed ACK of the head.
+  def test_streamed_responses_on_a_reused_connection_are_not_held_back
+    file = write("clip.bin", "x" * 1000)
+    serve_file(file, offset: 0, length: 1000, total: 1000)
+    socket = connect
+    started = now
+    20.times do
+      socket.write(request("GET", "/media"))
+      assert_equal 1000, read_reply(socket).body.bytesize
+    end
+
+    assert_operator now - started, :<, 0.5
   end
 
   def test_streams_an_empty_file
