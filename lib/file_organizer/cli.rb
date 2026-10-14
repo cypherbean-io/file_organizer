@@ -1,12 +1,15 @@
 # frozen_string_literal: true
 
 require "optparse"
-require "digest"
 
 module FileOrganizer
   # Interactive command-line interface: walks the files of a directory one
   # by one, shows their details, and offers open/view, rename, copy, move
   # and delete actions.
+  #
+  # It also parses the options for, and hands over to, the graphical
+  # interface (see FileOrganizer::Gui), which offers the same actions in a
+  # page instead of a prompt.
   class CLI
     MODES = %i[general photo audio].freeze
 
@@ -29,28 +32,19 @@ module FileOrganizer
     # another program that might. Read-only mode refuses all of them.
     MUTATING_ACTIONS = %i[open rename copy move delete].freeze
 
-    # Extensions the platform openers treat as "run this", whatever the bytes
-    # inside happen to look like.
-    LAUNCHABLE_EXTENSIONS = %w[
-      .desktop .lnk .url .scf .hta .reg .exe .com .bat .cmd .ps1 .psm1 .msi
-      .scr .pif .vbs .vbe .wsf .wsh .jar .app .command .scpt .workflow
-    ].freeze
-
-    # Directories whose contents are almost never what someone means to
-    # reorganize; pointing at one takes an explicit confirmation first.
-    GUARDED_DIRECTORIES = %w[
-      /bin /boot /dev /etc /lib /lib32 /lib64 /proc /root /sbin /srv /sys
-      /usr /var /Applications /Library /System /Volumes /Windows
-    ].freeze
-
     def initialize(argv)
       @mode = :general
       @read_only = false
       @dry_run = false
+      @gui = false
+      @port = 0
+      @browser = true
       @directory_arg = parse_options(argv)
     end
 
     def run
+      return run_gui if @gui
+
       directory = resolve_directory
       return if directory.nil?
       return unless confirm_guarded_directory(directory)
@@ -88,6 +82,10 @@ module FileOrganizer
                 "Mode: general (default), photo, audio") { |m| @mode = m.to_sym }
         opts.on("--read-only", "Inspect only: rename, copy, move, delete and open are all disabled") { @read_only = true }
         opts.on("--dry-run", "Prompt as usual but report what each action would do, changing nothing") { @dry_run = true }
+        opts.on("-g", "--gui", "Open the graphical interface in your browser") { @gui = true }
+        opts.on("-p", "--port PORT", Integer,
+                "GUI port (default: an unused port chosen by the OS)") { |p| @port = p }
+        opts.on("--[no-]browser", "GUI: launch the browser automatically (default: yes)") { |b| @browser = b }
         opts.on("-h", "--help", "Show this help") do
           puts opts
           exit
@@ -111,11 +109,28 @@ module FileOrganizer
       @dry_run && !@read_only
     end
 
+    # Starts the local web GUI; the terminal is only used for the banner and
+    # for the same guarded-directory confirmation the prompt-driven mode asks.
+    def run_gui
+      abort("file_organizer: --port must be between 0 and 65535.") unless (0..65_535).cover?(@port)
+
+      directory = File.expand_path(@directory_arg || Dir.pwd)
+      error = Directory.error(directory)
+      abort("file_organizer: #{Console.safe(error)}") if error
+      return unless confirm_guarded_directory(directory)
+
+      require_relative "gui"
+      Gui.start(directory: directory, mode: @mode, port: @port, open_browser: @browser,
+                read_only: @read_only, dry_run: dry_run?)
+    rescue Interrupt
+      Console.say("\nStopped.")
+    end
+
     def resolve_directory
       if @directory_arg
         directory = File.expand_path(@directory_arg)
-        error = directory_error(directory)
-        abort("file_organizer: #{error}") if error
+        error = Directory.error(directory)
+        abort("file_organizer: #{Console.safe(error)}") if error
         return directory
       end
 
@@ -124,23 +139,15 @@ module FileOrganizer
         return nil if input.nil? || input.empty?
 
         directory = File.expand_path(input)
-        error = directory_error(directory)
+        error = Directory.error(directory)
         return directory if error.nil?
 
-        Console.say("  #{error}")
+        Console.say("  #{Console.safe(error)}")
       end
     end
 
-    def directory_error(directory)
-      return "does not exist: #{Console.safe(directory)}" unless File.exist?(directory)
-      return "not a directory: #{Console.safe(directory)}" unless File.directory?(directory)
-      return "directory is not readable: #{Console.safe(directory)}" unless File.readable?(directory)
-
-      nil
-    end
-
     def confirm_guarded_directory(directory)
-      return true if @read_only || !guarded_directory?(directory)
+      return true if @read_only || !Directory.guarded?(directory)
 
       Console.say("#{Console.safe(directory)} is a system or home directory — its files are")
       Console.say("almost certainly not what you meant to reorganize.")
@@ -150,30 +157,12 @@ module FileOrganizer
       false
     end
 
-    def guarded_directory?(directory)
-      return true if directory == "/" || directory == home_directory
-
-      GUARDED_DIRECTORIES.any? { |root| directory == root || directory.start_with?("#{root}/") }
-    end
-
-    def home_directory
-      File.expand_path(Dir.home)
-    rescue ArgumentError
-      nil
-    end
-
     # Regular files and symlinks only — subdirectories are never touched.
     # One lstat per entry: in general mode the file's content is not read at
     # all until that file is actually reached.
     def scan(directory)
-      Dir.children(directory).sort_by(&:downcase).filter_map do |name|
-        info = FileInfo.new(File.join(directory, name))
-        next unless info.regular? || info.symlink?
-
-        info if include_in_mode?(info)
-      rescue SystemCallError
-        nil
-      end
+      files, _truncated = Directory.entries(directory)
+      files.select { |info| include_in_mode?(info) }
     end
 
     def include_in_mode?(info)
@@ -247,8 +236,8 @@ module FileOrganizer
 
     def menu_prompt(info)
       parts = []
-      parts << "[o]pen" if !@read_only && openable?(info)
-      parts << "[v]iew" if viewable?(info)
+      parts << "[o]pen" if !@read_only && info.openable?
+      parts << "[v]iew" if info.textual?
       parts.concat(mutating_menu_parts(info)) unless @read_only
       parts << "[h]ash" if info.regular?
       parts.push("[n]ext", "[q]uit")
@@ -268,24 +257,8 @@ module FileOrganizer
       MENU_KEYS[input.downcase]
     end
 
-    def openable?(info)
-      info.regular? && !info.executable_bit? && info.category != :executable &&
-        !launchable_extension?(info)
-    end
-
-    # Some extensions are instructions to the desktop, not data: a .desktop
-    # entry or a .lnk shortcut hands the system an arbitrary command line
-    # even though the file itself is inert text.
-    def launchable_extension?(info)
-      LAUNCHABLE_EXTENSIONS.include?(File.extname(info.name).downcase)
-    end
-
-    def viewable?(info)
-      info.regular? && info.detection&.textual?
-    end
-
     def open_file(info)
-      unless openable?(info)
+      unless info.openable?
         Console.say("  Opening is disabled for this file (executable content, a launcher file type, or not a regular file).")
         return
       end
@@ -309,7 +282,7 @@ module FileOrganizer
     end
 
     def view_file(info)
-      unless viewable?(info)
+      unless info.textual?
         Console.say("  In-terminal preview is only available for text-based files; use [o]pen instead.")
         return
       end
@@ -355,22 +328,9 @@ module FileOrganizer
         return
       end
       Console.say("  Computing SHA-256 (may take a moment for large files)…") if info.size > 50 * 1024 * 1024
-      Console.field("SHA-256", checksum(info.path))
+      Console.field("SHA-256", SafeFile.sha256(info.path))
     rescue SystemCallError, IOError => e
       Console.say("  Could not compute checksum: #{e.message}")
-    end
-
-    # Streamed in 1 MiB chunks, so even a huge file never lands in memory,
-    # and read through SafeFile so the digest describes the file that was
-    # inspected rather than whatever a link now points at.
-    def checksum(path)
-      digest = Digest::SHA256.new
-      SafeFile.open(path) do |io|
-        while (chunk = io.read(1 << 20))
-          digest.update(chunk)
-        end
-      end
-      digest.hexdigest
     end
   end
 end

@@ -51,7 +51,7 @@ module FileOrganizer
     # what the content actually is — a classic disguise for malicious files.
     def extension_mismatch?(path, detection)
       return false if detection.nil? || detection.format == :unknown
-      expected = EXTENSION_FORMATS[File.extname(path).downcase]
+      expected = EXTENSION_FORMATS[File.extname(path).b.downcase]
       return false if expected.nil? || expected == detection.format
 
       EQUIVALENT_FORMATS.none? { |group| group.include?(expected) && group.include?(detection.format) }

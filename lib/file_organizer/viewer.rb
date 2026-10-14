@@ -27,6 +27,18 @@ module FileOrganizer
       !!system(*command)
     end
 
+    # Hands the GUI's launch page (see Gui.write_launch_page) to the system
+    # browser, again as an argument vector, and quietly: the browser's own
+    # chatter does not belong in the terminal.
+    def open_in_browser(page)
+      return false unless File.extname(page) == ".html"
+
+      command = opener_command(File.expand_path(page))
+      return false if command.nil?
+
+      !!system(*command, out: File::NULL, err: File::NULL)
+    end
+
     def opener_command(absolute_path)
       case RbConfig::CONFIG["host_os"]
       when /darwin/i then ["open", absolute_path]
