@@ -174,6 +174,50 @@ class TestOperationsRename < Minitest::Test
     refute_path_exists file
   end
 
+  # Regression: File.identical? follows links, so a symlink and its target
+  # counted as "the same file", the collision check was skipped, and the
+  # rename replaced the target with a link to itself — its content gone.
+  def test_renaming_a_symlink_onto_the_name_of_its_own_target_is_a_conflict
+    target = write("a.txt", "precious\n")
+    File.symlink(target, path("link"))
+    result = Operations.rename(path("link"), "a.txt")
+
+    assert result.conflict?, result.inspect
+    refute File.symlink?(target)
+    assert_equal "precious\n", File.read(target)
+    assert File.symlink?(path("link"))
+  end
+
+  def test_renaming_a_file_onto_a_symlink_that_points_at_it_is_a_conflict
+    file = write("a.txt", "content\n")
+    File.symlink(file, path("link"))
+    result = Operations.rename(file, "link")
+
+    assert result.conflict?, result.inspect
+    assert File.symlink?(path("link"))
+    assert_equal "content\n", File.read(file)
+  end
+
+  # Two hard links are two names for one file; renaming one onto the other
+  # used to report success while nothing happened.
+  def test_renaming_a_file_onto_another_hard_link_to_it_is_a_conflict
+    file = write("a.txt", "content\n")
+    File.link(file, path("b.txt"))
+    result = Operations.rename(file, "b.txt")
+
+    assert result.conflict?, result.inspect
+    assert_equal %w[a.txt b.txt], Dir.children(@dir).sort
+  end
+
+  def test_renaming_to_the_same_name_does_nothing
+    file = write("a.txt")
+    result = Operations.rename(file, "a.txt")
+
+    assert result.ok?
+    assert_equal file, result.path
+    assert_includes result.message, "nothing to do"
+  end
+
   def test_missing_source_is_an_error_not_an_exception
     result = Operations.rename(path("missing.txt"), "after.txt")
 
@@ -456,8 +500,9 @@ class TestOperationsTransfer < Minitest::Test
   end
 
   # A symbolic link can appear at the target between the check and the
-  # write. Simulate that race by skipping the check: the O_NOFOLLOW open in
-  # copy_bytes must still refuse to follow it.
+  # write. Simulate that race by skipping the check: the copy is written to a
+  # fresh temporary file and renamed over the name, which replaces the link
+  # itself and never writes to what it points at.
   def test_copy_does_not_follow_a_symlink_planted_after_the_check
     outside = write("outside/precious.txt", "must survive\n")
     File.symlink(outside, @target)
@@ -466,22 +511,70 @@ class TestOperationsTransfer < Minitest::Test
       Operations.copy(@source, @destination, overwrite: true)
     end
 
-    assert result.error?, result.message
-    assert_includes result.message, "Copy failed"
+    assert result.ok?, result.message
     assert_equal "must survive\n", File.read(outside)
-    assert File.symlink?(@target)
+    refute File.symlink?(@target)
+    assert_equal "payload\n", File.read(@target)
   end
 
-  # rename(2) cannot cross filesystems; the move then falls back to the
-  # O_NOFOLLOW copy and removes the source only afterwards.
+  # Without overwrite consent a name taken after the check must not be
+  # replaced: the copy is put in place with link(2), which refuses.
+  def test_copy_does_not_replace_a_file_created_after_the_check
+    result = Operations.stub(:present?, false) do
+      File.binwrite(@target, "arrived meanwhile\n")
+      Operations.copy(@source, @destination)
+    end
+
+    assert result.error?, result.message
+    assert_equal "arrived meanwhile\n", File.read(@target)
+    assert_empty Dir.children(@destination).grep(/\.part\z/), "the temporary file is cleaned up"
+  end
+
+  # An interrupted copy must leave neither a partial file under the real
+  # name nor a stray temporary file.
+  def test_a_copy_that_fails_midway_leaves_nothing_behind
+    File.binwrite(@target, "original\n")
+    result = IO.stub(:copy_stream, ->(*) { raise Errno::ENOSPC }) do
+      Operations.copy(@source, @destination, overwrite: true)
+    end
+
+    assert result.error?
+    assert_includes result.message, "Copy failed"
+    assert_equal "original\n", File.read(@target)
+    assert_equal ["report.txt"], Dir.children(@destination)
+  end
+
+  # A named pipe at the target name used to pass the check, and the copy
+  # then blocked forever opening it for writing.
+  def test_a_fifo_at_the_target_is_refused_even_with_overwrite
+    File.mkfifo(@target)
+    check = Operations.check_transfer(@source, @destination, overwrite: true)
+
+    assert check.error?, check.inspect
+    assert_includes check.message, "not a regular file"
+    assert File.pipe?(@target)
+  end
+
+  # Makes link(2) and rename(2) of the source fail as they do across
+  # filesystems, while leaving the copy's own temporary file alone.
+  def across_filesystems(&block)
+    link = File.method(:link)
+    rename = File.method(:rename)
+    cross = lambda do |original|
+      ->(from, to) { from == @source ? raise(Errno::EXDEV) : original.call(from, to) }
+    end
+    File.stub(:link, cross.call(link)) { File.stub(:rename, cross.call(rename), &block) }
+  end
+
+  # link(2) and rename(2) cannot cross filesystems; the move then falls back
+  # to the copy and removes the source only afterwards.
   def test_move_across_filesystems_falls_back_to_copy_and_unlink
     File.chmod(0o640, @source)
     stamp = Time.now - 3600
     File.utime(stamp, stamp, @source)
+    source_inode = File.stat(@source).ino
 
-    result = File.stub(:rename, ->(*) { raise Errno::EXDEV }) do
-      Operations.move(@source, @destination)
-    end
+    result = across_filesystems { Operations.move(@source, @destination) }
 
     assert result.ok?, result.message
     assert_nil result.path
@@ -489,11 +582,12 @@ class TestOperationsTransfer < Minitest::Test
     assert_equal "payload\n", File.read(@target)
     assert_equal 0o640, File.stat(@target).mode & 0o7777
     assert_equal stamp.to_i, File.mtime(@target).to_i
+    refute_equal source_inode, File.stat(@target).ino, "the fallback copy really ran"
   end
 
   def test_failed_cross_filesystem_copy_keeps_the_source
-    result = File.stub(:rename, ->(*) { raise Errno::EXDEV }) do
-      Operations.stub(:copy_bytes, ->(*) { raise Errno::ENOSPC }) do
+    result = across_filesystems do
+      Operations.stub(:copy_bytes, ->(*, **) { raise Errno::ENOSPC }) do
         Operations.move(@source, @destination)
       end
     end

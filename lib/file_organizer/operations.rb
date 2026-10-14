@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "securerandom"
+
 module FileOrganizer
   # The file operations themselves, with no user interaction: every input is
   # validated, nothing is overwritten unless the caller explicitly asks for
@@ -59,10 +61,10 @@ module FileOrganizer
         return failure(path, "Invalid name: no path separators, control characters, '.' or '..'.")
       end
 
+      return success(path, "The name is unchanged — nothing to do.") if new_name == File.basename(path)
+
       target = File.join(File.dirname(path), new_name)
-      # On a case-insensitive filesystem "notes.txt" and "Notes.TXT" are the
-      # same file, so a case-only rename is a rename, not a collision.
-      if !File.identical?(path, target) && present?(target)
+      if present?(target) && !case_only_rename?(path, target)
         return conflict(path, "A file named #{new_name} already exists")
       end
 
@@ -76,10 +78,36 @@ module FileOrganizer
       label = "#{File.basename(path)} to #{new_name}"
       return preview(path, "rename #{label}") if dry_run
 
-      rename_without_clobber(path, check.target, File.identical?(path, check.target))
+      rename_without_clobber(path, check.target, case_only_rename?(path, check.target))
       success(check.target, "Renamed to #{new_name}.")
     rescue SystemCallError => e
       failure(path, "Rename failed: #{e.message}")
+    end
+
+    # On a case-insensitive filesystem "notes.txt" and "Notes.TXT" name the
+    # same directory entry, so renaming one to the other is a rename, not a
+    # collision. It has to be that very entry — compared with lstat, which
+    # does not follow links — and a name that differs only in case: a
+    # symlink and the file it points at, or two hard links to one file, are
+    # separate entries, and renaming one onto the other would destroy it.
+    def case_only_rename?(path, target)
+      return false unless same_entry?(path, target)
+
+      fold_case(File.basename(path)) == fold_case(File.basename(target))
+    end
+
+    def same_entry?(path, target)
+      a = File.lstat(path)
+      b = File.lstat(target)
+      a.dev == b.dev && a.ino == b.ino
+    rescue SystemCallError
+      false
+    end
+
+    def fold_case(name)
+      name.unicode_normalize(:nfc).downcase(:fold)
+    rescue ArgumentError, Encoding::CompatibilityError # not valid UTF-8
+      name.b.downcase
     end
 
     # --- delete ---------------------------------------------------------------
@@ -121,7 +149,7 @@ module FileOrganizer
       error = target_error(target)
       return failure(path, error) if error
 
-      exists = File.exist?(target)
+      exists = present?(target)
       return conflict(path, "#{File.basename(path)} already exists in #{destination_dir}") if exists && !overwrite
 
       ready(path, target, exists: exists)
@@ -137,10 +165,10 @@ module FileOrganizer
       return preview(path, "#{operation} #{File.basename(path)} to #{check.target}") if dry_run
 
       if operation == :copy
-        copy_bytes(path, check.target)
+        copy_bytes(path, check.target, replace: check.exists)
         success(path, "Copied to #{check.target}.")
       else
-        move_bytes(path, check.target)
+        move_bytes(path, check.target, replace: check.exists)
         success(nil, "Moved to #{check.target}.")
       end
     rescue SystemCallError, IOError, ArgumentError => e
@@ -182,18 +210,21 @@ module FileOrganizer
       error&.sub(/\A./, &:upcase)
     end
 
-    # A destination name that is not a plain file is refused outright.
-    # Writing through a symbolic link would put the data wherever the link
-    # points — outside the directory the user picked, and under a name the
-    # confirmation never mentioned. A directory at that name would quietly
-    # turn "replace that file" into "put it inside".
+    # A destination name that is taken by anything but a plain file is
+    # refused outright. Writing through a symbolic link would put the data
+    # wherever the link points — outside the directory the user picked, and
+    # under a name the confirmation never mentioned. A directory at that name
+    # would quietly turn "replace that file" into "put it inside", and a named
+    # pipe or device would swallow the copy or hang it.
     def target_error(target)
+      stat = File.lstat(target)
       name = File.basename(target)
-      if File.symlink?(target)
-        return "#{name} in that directory is a symbolic link — refusing to write through it."
-      end
-      return "#{name} in that directory is a directory, not a file." if File.directory?(target)
+      return "#{name} in that directory is a symbolic link — refusing to write through it." if stat.symlink?
+      return "#{name} in that directory is a directory, not a file." if stat.directory?
+      return "#{name} in that directory is not a regular file — refusing to replace it." unless stat.file?
 
+      nil
+    rescue Errno::ENOENT
       nil
     end
 
@@ -203,48 +234,85 @@ module FileOrganizer
 
     # --- filesystem -----------------------------------------------------------
 
-    # File.rename replaces an existing target silently, so for a regular file
-    # the new name is staked out with link(2) first — that fails if the name
-    # was taken in the moment since the check — and only then is the old name
-    # dropped. Where hard links are unavailable (another filesystem, a
-    # symlink, a case-only rename on a case-insensitive volume) it falls back
-    # to the plain rename.
-    def rename_without_clobber(path, target, same_file)
-      return File.rename(path, target) if same_file || !File.lstat(path).file?
+    # A case-only rename is the one rename that has to replace the name it
+    # goes to (it is the same entry). Anything else must not clobber a name
+    # taken in the moment since the check.
+    def rename_without_clobber(path, target, case_only)
+      return File.rename(path, target) if case_only
+      return put_in_place(path, target, replace: false) if File.lstat(path).file?
+
+      # link(2) on a symlink follows it on some systems, so a link is
+      # renamed directly, after one more look at the target.
+      raise Errno::EEXIST, target if present?(target)
+
+      File.rename(path, target)
+    end
+
+    # Gives +from+ the name +to+. With replace: false the name is staked out
+    # with link(2), which fails if something took it since the check, and
+    # only then is the old name dropped — rename(2) would silently replace
+    # it. Where hard links are not supported it falls back to the rename,
+    # after one more look. rename(2) replaces a name itself, never what a
+    # link at that name points to.
+    def put_in_place(from, to, replace:)
+      return File.rename(from, to) if replace
 
       begin
-        File.link(path, target)
-      rescue Errno::EEXIST
+        File.link(from, to)
+      rescue Errno::EEXIST, Errno::EXDEV
         raise
       rescue SystemCallError
-        return File.rename(path, target)
+        raise Errno::EEXIST, to if present?(to)
+
+        return File.rename(from, to)
       end
-      File.unlink(path)
+      File.unlink(from)
     end
 
-    # Opens the destination explicitly with O_NOFOLLOW so that a symbolic
-    # link appearing at the target after +target_error+ ran still cannot
-    # redirect the copy out of the chosen directory. Permission bits and
-    # timestamps are carried over; set-user-ID and set-group-ID bits are not.
-    def copy_bytes(source, target)
+    # The copy is written under a temporary name in the destination directory
+    # and only put in place once it is complete, so an interrupted copy never
+    # leaves a truncated file under the real name, and a file it replaces
+    # survives until the new one is ready. The temporary file is created with
+    # O_EXCL and O_NOFOLLOW, its permissions are set through the descriptor
+    # and its timestamps with lutime, so a link planted along the way can
+    # redirect none of it. Permission bits and timestamps are carried over;
+    # set-user-ID and set-group-ID bits are not.
+    def copy_bytes(source, target, replace:)
       stat = File.lstat(source)
-      flags = File::WRONLY | File::CREAT | File::TRUNC | SafeFile::NOFOLLOW
-      File.open(target, flags, 0o600) do |output|
+      temp = File.join(File.dirname(target), ".file_organizer-#{SecureRandom.hex(8)}.part")
+      flags = File::WRONLY | File::CREAT | File::EXCL | SafeFile::NOFOLLOW
+      File.open(temp, flags, 0o600) do |output|
         output.binmode
         SafeFile.open(source) { |input| IO.copy_stream(input, output) }
+        output.chmod(stat.mode & 0o777)
       end
-      File.chmod(stat.mode & 0o777, target)
-      File.utime(stat.atime, stat.mtime, target)
+      set_times(temp, stat)
+      put_in_place(temp, target, replace: replace)
+      temp = nil
+    ensure
+      discard(temp) if temp
     end
 
-    # rename(2) replaces the destination name itself, so it cannot write
-    # through a link either. Across filesystems it falls back to the
-    # O_NOFOLLOW copy, and the source is only removed once that succeeded.
-    def move_bytes(source, target)
-      File.rename(source, target)
+    # rename(2) and link(2) work on names, so a move cannot write through a
+    # link either. Across filesystems it falls back to the copy above, and
+    # the source is only removed once that succeeded.
+    def move_bytes(source, target, replace:)
+      put_in_place(source, target, replace: replace)
     rescue Errno::EXDEV
-      copy_bytes(source, target)
+      copy_bytes(source, target, replace: replace)
       File.unlink(source)
+    end
+
+    def set_times(path, stat)
+      File.lutime(stat.atime, stat.mtime, path)
+    rescue NotImplementedError # no lutimes(2) here, and no symlinks to fear
+      File.utime(stat.atime, stat.mtime, path)
+    end
+
+    def discard(path)
+      File.unlink(path)
+    rescue SystemCallError
+      nil
     end
 
     # --- results --------------------------------------------------------------
