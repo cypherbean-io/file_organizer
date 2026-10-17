@@ -14,8 +14,8 @@ confirmation rules in README.md's "Safeguards" and "Security design" sections.
 | --- | --- |
 | Run (terminal) | `ruby bin/file_organizer [options] [DIRECTORY]` |
 | Run (GUI) | `ruby bin/file_organizer --gui [options] [DIRECTORY]` |
-| Test (all) | `ruby test/all.rb` |
-| Test (single file) | `ruby test/test_operations.rb` |
+| Test (all) | `ruby tests/all.rb` |
+| Test (single file) | `ruby tests/test_operations.rb` |
 
 Prefer running a single test file over the whole suite while iterating. No
 gems to install, no build/lint/typecheck step — this is pure Ruby 3.0+
@@ -46,8 +46,8 @@ standard library.
 - `# frozen_string_literal: true` at the top of every file.
 - One class/module per file under `lib/file_organizer/`, loaded explicitly
   from `lib/file_organizer.rb` (no autoloading).
-- Tests use minitest from the standard library (`test/test_*.rb`, run via
-  `test/all.rb`); no mocking framework beyond what minitest provides.
+- Tests use minitest from the standard library (`tests/test_*.rb`, run via
+  `tests/all.rb`); no mocking framework beyond what minitest provides.
 
 ## Workflow
 

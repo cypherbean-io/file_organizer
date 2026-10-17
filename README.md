@@ -189,7 +189,7 @@ created/modified/accessed times, hidden/executable/symlink status.
 ## Tests
 
 ```sh
-ruby test/all.rb
+ruby tests/all.rb
 ```
 
 Uses minitest from the standard library; no gems to install. The suite
@@ -271,7 +271,7 @@ lib/file_organizer/gui/app.rb          Routing, guards, request handling
 lib/file_organizer/gui/session.rb      Which folder is being reviewed, and how
 lib/file_organizer/gui/presenter.rb    Files and metadata as plain data
 lib/file_organizer/gui/web/            The page: index.html, app.css, app.js
-test/                                  Test suite (ruby test/all.rb)
+tests/                                 Test suite (ruby tests/all.rb)
 ```
 
 Both interfaces share the core: `Operations` performs every filesystem

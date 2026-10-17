@@ -93,7 +93,7 @@ It should print the version number (for example `1.0.0`).
 Optionally, run the test suite to confirm everything works on your machine:
 
 ```sh
-ruby test/all.rb
+ruby tests/all.rb
 ```
 
 ### Step 4 (optional) — Run it from anywhere
