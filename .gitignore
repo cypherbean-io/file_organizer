@@ -2,3 +2,18 @@
 /tmp/fixtures/
 /tmp/scratch*/
 /tmp/dest/
+
+# --- Claude Code ---
+CLAUDE.local.md
+# .claude/settings.local.json    # left out by init-claude-repo.sh: matches tracked files
+.claude/agent-memory-local/
+.claude/*.local.md
+plans/
+
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
