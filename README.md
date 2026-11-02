@@ -12,6 +12,9 @@ including the photo (EXIF) and audio (ID3, FLAC, Vorbis, …) metadata parsers
 and the web server behind the graphical interface, uses only the standard
 library. The program never touches the network.
 
+New to it? The [User Guide](docs/USER_GUIDE.md) covers installation and
+walks through both interfaces step by step.
+
 ## Usage
 
 ```sh
